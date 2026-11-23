@@ -117,14 +117,5 @@ class SaveData:
     # --- the planner's context ------------------------------------------------------------------------------
 
     def save_context(self, date: str, messages: list[dict], turns: int = 0) -> None:
+        """The finished day's conversation with the planner, kept as a record (a new day always starts fresh)."""
         write_atomic(self.context_file, json.dumps({"date": date, "turns": turns, "messages": clean(messages)}, default=str, ensure_ascii=False))
-
-    def load_context(self, date: str) -> dict | None:
-        """The planner's saved context, if it's from this game day."""
-        try:
-            saved = json.loads(self.context_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(saved, dict) or saved.get("date") != date or not isinstance(saved.get("messages"), list) or not saved["messages"]:
-            return None
-        return saved

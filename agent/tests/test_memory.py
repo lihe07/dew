@@ -61,8 +61,12 @@ def test_remember_sets_and_replaces_and_forget_removes(tmp_path):
     assert out.ok and out.text == "remembered shop.pierre.hours (1 keys)"
     out = b._memory("remember", {"key": "shop.pierre.hours", "value": "9am-5pm"})
     assert out.ok and out.text.startswith("replaced shop.pierre.hours")
+    assert m.facts == {"shop.pierre.hours": "9am-5pm"}
+    assert not (tmp_path / "memory.json").exists()  # written only when the day ends, as the game saves
+    m.save()
     assert json.loads((tmp_path / "memory.json").read_text()) == {"shop.pierre.hours": "9am-5pm"}
     assert b._memory("forget", {"key": "shop.pierre.hours"}).text == "forgot shop.pierre.hours (0 keys)"
+    m.save()
     assert json.loads((tmp_path / "memory.json").read_text()) == {}
     assert not b._memory("forget", {"key": "nothing.here"}).ok
 
@@ -96,13 +100,15 @@ def test_memory_is_written_atomically(tmp_path, monkeypatch):
     path = tmp_path / "memory.json"
     m = Memory(path)
     m.remember("a", "1")
+    m.save()
 
     def crash(src, dst):
         raise OSError("disk died")
 
     monkeypatch.setattr(os, "replace", crash)
+    m.remember("b", "2")
     with pytest.raises(OSError):
-        m.remember("b", "2")
+        m.save()
     assert json.loads(path.read_text()) == {"a": "1"}  # the old file is whole
     assert [p.name for p in tmp_path.iterdir()] == ["memory.json"]  # and no temporary file is left
 
@@ -245,41 +251,12 @@ def test_the_context_is_saved_after_each_planner_turn(tmp_path):
     assert saved["messages"][1] == saved_messages()[1]
 
 
-def test_the_brain_reports_complete_turns():
-    b = brain_with(Memory())
-    seen = []
-    b.on_context = lambda messages: seen.append(len(messages))
-    b._append("user", [{"type": "text", "text": "a"}])
-    b._append("assistant", [{"type": "text", "text": "b"}])
-    b._append("user", [{"type": "text", "text": "c"}])
-    assert seen == [1, 3]  # only when the last message is the user's, so every tool use has its result
-
-
-def test_a_restart_on_the_same_day_resumes_its_context(tmp_path, monkeypatch):
+def test_a_restart_starts_the_day_from_its_morning(tmp_path, monkeypatch):
+    """The game saves only at night, so a run stopped partway through a day begins it again, fresh: no saved context is resumed."""
     d = make_director(tmp_path, monkeypatch)
-    d.memory.remember("plan.today", "plant parsnips")
     d.save.save_context(DATE, saved_messages(), turns=7)
     prompt = asyncio.run(d.opening(DATE))
-    assert d.brain.messages[0]["content"][0]["text"] == "morning report" and len(d.brain.messages) == 3
-    assert d.brain.usage.turns == 7
-    assert "restarted" in prompt and "continue the day" in prompt
-    assert "# Memory\nplan.today: plant parsnips" in prompt and "status: 9:00 am" in prompt
-    assert "GOAL" not in prompt  # not a fresh morning
-    assert d.resumable is False
-
-
-def test_a_new_day_starts_fresh(tmp_path, monkeypatch):
-    d = make_director(tmp_path, monkeypatch)
-    d.save.save_context("Mon spring 3, year 1", saved_messages())
-    prompt = asyncio.run(d.opening(DATE))
-    assert d.brain.messages == [] and prompt.startswith("GOAL: farm") and "Plan the day" in prompt
-
-
-def test_only_the_first_day_of_a_run_resumes(tmp_path, monkeypatch):
-    d = make_director(tmp_path, monkeypatch)
-    d.resumable = False
-    d.save.save_context(DATE, saved_messages())
-    assert asyncio.run(d.opening(DATE)).startswith("GOAL")
+    assert d.brain.messages == [] and prompt.startswith("GOAL: farm") and "an errand or a few hours" in prompt
 
 
 # --- consolidation -------------------------------------------------------------------------------------------

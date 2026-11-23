@@ -52,6 +52,9 @@ class Display:
     def _planner(self, kind, text, data, ok):
         pass  # the full-screen view shows this as its activity line
 
+    def _script(self, kind, text, data, ok):
+        pass  # likewise
+
     def _wake(self, kind, text, data, ok):
         self.console.print(Text("⏸ woken: " + text, "grey62"))
 
@@ -149,12 +152,11 @@ def action_lines(data: dict, ok: bool) -> list[Text]:
     """A finished action: one line, plus anything said or shown meanwhile."""
     s, value, entries = data.get("status") or {}, data.get("value"), data.get("journal") or []
     line = Text(f"{clock(s.get('clock'))} ", "grey50")
-    line.append("✓ " if ok else "✗ ", "green" if ok else "bold red")
     line.append(call_text(data["name"], data.get("args") or {}), "bold bright_white" if ok else "bold red")
     if ok and (summary := summarize(value)):
         line.append(f"  {summary}", "default")
-    if not ok:
-        line.append(f"  {(data.get('error') or '')[:160]}", "red")
+    if not ok:  # red, with why: no mark needed
+        line.append(f" — {(data.get('error') or 'failed')[:160]}", "red")
     places = [e["text"].removeprefix("entered ") for e in entries if e["kind"] == "place"]
     if len(places) > 1:
         line.append("  via " + " → ".join(places[:-1]), "grey50")
@@ -163,11 +165,11 @@ def action_lines(data: dict, ok: bool) -> list[Text]:
     lines = [line]
     for e in entries:
         if e["kind"] in ("dialogue", "letter", "question", "level", "message", "quest", "chat", "event"):
-            lines.append(Text(f"      {e['kind']}: {e['text'][:200]}", "cyan" if e["kind"] in ("dialogue", "chat") else "grey62"))
+            lines.append(Text(f"  {e['kind']}: {e['text'][:200]}", "grey62" if e["kind"] in ("dialogue", "chat") else "grey50"))
     return lines
 
 
-EVENTS = {"log": ("│ ", "bright_cyan", "log: "), "judge": ("? ", "magenta", ""), "safety": ("⚠ ", "bold yellow", "SAFETY: "), "busy": ("⟳ ", "blue", "")}
+EVENTS = {"log": ("│ ", "bright_cyan", "printed: "), "judge": ("? ", "magenta", ""), "safety": ("⚠ ", "bold yellow", "SAFETY: "), "busy": ("⟳ ", "blue", "")}
 
 
 def event_text(kind: str, text: str) -> Text:

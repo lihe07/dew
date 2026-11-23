@@ -69,15 +69,13 @@ class Memory:
         if key not in self.facts and len(self.facts) >= MAX_KEYS:
             return False, f"memory is full ({MAX_KEYS} keys): forget stale facts first, or replace an existing key"
         old = self.facts.get(key)
-        self.facts[key] = value.strip()
-        self.save()
+        self.facts[key] = value.strip()  # written to disk when the day ends, as the game saves only then
         return True, f"{'replaced' if old is not None else 'remembered'} {key} ({len(self.facts)} keys)"
 
     def forget(self, key: Any) -> tuple[bool, str]:
         if not isinstance(key, str) or key not in self.facts:
             return False, f"there is no key {key!r} to forget"
         del self.facts[key]
-        self.save()
         return True, f"forgot {key} ({len(self.facts)} keys)"
 
     def render(self) -> str:

@@ -5,7 +5,7 @@ An AI agent that plays Stardew Valley 1.6 by the real rules: it walks everywhere
 ```
 stardew play (Python)                                          Stardew Valley + SMAPI
   Director  days, diary, memory, bedtime                        Stardew Bridge mod (C#)
-  Brain     planner model: remember, forget, run, wait◀── socket ──▶  attach input step read frame path follow cheat
+  Brain     planner model: run, wait, screenshot, web, remember, forget◀── socket ──▶  attach input step read frame path follow cheat
   Runner    plays the planner's Python scripts                    + a journal of everything shown on screen
   Skills    walk, swing, click, travel, fish...
 ```
@@ -14,7 +14,7 @@ The mod is a small, stable instruction set. Everything game-specific lives in Py
 
 ## Setup
 
-1. Put your Respan key in `.env` as `RESPAN_API_KEY=...` (git-ignored; only the agent reads it).
+1. Put your keys in `.env` (git-ignored; only the agent reads it): `RESPAN_API_KEY=...` for the models, and `TINYFISH_API_KEY=...` for web lookups (optional; without it the `web` tool says lookups are off).
 2. `just install` builds the mod and copies it to the game's Mods folder. If the game isn't in Steam's default library, put `STARDEW_PATH="/path/to/Stardew Valley"` in `.env`.
 3. `just setup-wasm` fetches the WebAssembly Python that the planner's scripts run in (see The script sandbox).
 4. Start the game through SMAPI and load a save, or let the agent load one with `--save FOLDER` (see `just saves`) or start one with `--new NAME`.
@@ -49,6 +49,7 @@ Tests: `just test` (offline: fakes for the game and the model, no network) and `
 | `--data DIR` | where the agent keeps its data (default `$STARDEW_DATA`, else `./stardew-data`; `just` sets it to `stardew-data/` where you ran it) |
 | `--turns N` | most model turns per day (default 60) |
 | `--speed N` | how fast the world runs, single-player only (default 1; up to 16, but faster makes combat reflexes less reliable) |
+| `--web-model MODEL` | the research subagent behind the `web` tool (default hy4-flash) |
 | `--no-web` | no web lookups |
 | `--plain` | print a line per action instead of the full-screen view (used anyway when the output isn't a terminal) |
 | `--verbose` | with `--plain`: full thoughts, reports, results, and scripts |
@@ -60,17 +61,19 @@ Tests: `just test` (offline: fakes for the game and the model, no network) and `
 
 The world never pauses: it runs while the planner thinks, as in multiplayer. In single-player, `--speed` runs it up to 16 times faster; game time, energy, and odds are unchanged. There are three layers.
 
-**1. The planner** (`brain.py`, `script.py`). A model with four tools:
+**1. The planner** (`brain.py`, `script.py`). A model with six tools:
 
-- `run`: start a Python script written against an SDK (`go`, `harvest`, `water`, `plant`, `fish`, `mine`, `buy`, `talk`, ...). It runs in the background while the model thinks and replaces any script already running. `stop_if` lists situations to watch for; `finish_current` lets the running action end first.
-- `wait`: end the turn; the model is woken when the script ends, raises, or asks.
+- `run`: start a Python script written against an SDK (`go`, `harvest`, `water`, `plant`, `fish`, `mine`, `buy`, `talk`, ...). It runs in the background while the model thinks and replaces any script already running. `finish_current` lets the running action end first.
+- `screenshot(radius, grid)`: see the screen now, without disturbing the script.
+- `web(question)`: a small research subagent (`web.py`, `--web-model`, default hy4-flash) searches and reads pages through TinyFish's search and fetch APIs, then answers in a few sentences, so the planner's context never fills with web pages. At most 8 lookups a day.
+- `wait`: end the turn; the model is woken when the script ends, raises, asks, or prints.
 - `remember(key, value)`: set or replace a fact in its memory; `forget(key)`: remove one (see Memory).
 
-The planner also looks through scripts: SDK views (`state`, `look_map`, `find`, `tile_info`, `exits`, `people`, `quests`, `recipes`, `item_info`, `screenshot`, `web`) return text or data for the script to print, and the wake-up when the script ends carries its output. A screenshot reaches the planner as an image in that wake-up.
+Every wake-up carries the farmer's status and a text map around it. For more, a script reads SDK facts (`state`, `find`, `people`, `item_info`, `quests`, `recipes`, `exits`, `tile_info`, `look_map`) and prints what the planner needs.
 
-The model is woken when a script ends, raises, or calls `ask(question)`, and when you steer. Old screenshots are dropped and the context is summarized once it passes about 70k tokens.
+The model is woken when a script ends, raises an exception it doesn't catch, or calls `ask(question)` (which ends it), when it prints (`print` queues a message and wakes the planner while the script keeps running; messages are batched, at most one wake-up every 30 seconds), and when you steer or the day ends. Old screenshots are dropped and the context is summarized once it passes about 70k tokens.
 
-**2. span-02** (`decide.py`, `combat.py`), a fast decision model on the Respan gateway (`/v1/decisions`). In scripts, `check(situation)` returns True or False and `pick(description, options)` returns one option; both raise `Unsure` below 0.6 confidence. It reads plain facts (time, minutes until 2am, weather, location, health, energy, money, free slots, what is held, the last result, recent dialogue) and compares but can't do arithmetic. The same judge decides `stop_if`. In the mines, `combat.Tactics` asks the same judge to choose between options that are all already safe, such as fighting nearby monsters or taking a visible ladder; below 0.4 confidence it takes the safe default.
+**2. span-02** (`decide.py`, `combat.py`), a fast decision model on the Respan gateway (`/v1/decisions`). In scripts, `check(situation)` returns True or False and `pick(description, options)` returns one option; both raise `Unsure` below 0.6 confidence. It reads plain facts (time, minutes until 2am, weather, location, health, energy, money, free slots, what is held, the last result, recent dialogue) and compares but can't do arithmetic. In the mines, `combat.Tactics` asks the same judge to choose between options that are all already safe, such as fighting nearby monsters or taking a visible ladder; below 0.4 confidence it takes the safe default.
 
 **3. Deterministic routines** (no model):
 
@@ -99,7 +102,7 @@ try:
     while minutes_until_2am() > 240:
         mine(2)
         if check("a ladder down was found on a floor with lots of ore"):
-            log("good floor")
+            print("good floor")
 except (LowHealth, TimeToGoHome):
     go("Farm")
 ```
@@ -119,8 +122,7 @@ Surprise
 │   └── TimeToGoHome
 └── Happened
     ├── Question(choices)
-    ├── Cutscene
-    └── StopIf
+    └── Cutscene
 ```
 
 ## What you see
@@ -129,9 +131,9 @@ In a terminal, a full-screen view: the day's transcript on the left (the planner
 
 ## Steering from the terminal
 
-Type a line in the input box and press Enter: the script and its action stop, and the planner is woken with `PLAYER: your text`. `/later TEXT` queues the message for the next time it wakes, without interrupting. Input is only read when stdin is a terminal.
+Type a line in the input box and press Enter: it joins the planner's queue, next to what the script printed, and is shown above the input until the planner reads it. A waiting planner is woken at once; a thinking one reads it right after its current thought. The script keeps running; the planner decides what to do. Input is only read when stdin is a terminal.
 
-In the game, **F8** cancels the current action and gives you control; F8 again hands it back (the agent tells the planner you were there).
+In the game, **F8** gives you control: the script stops, the guard and the planner pause (no model calls), and the view says so. F8 again hands it back, and the planner is told to check what changed.
 
 ## Memory
 
@@ -150,11 +152,11 @@ stardew-data/Farm_123456789/
   memory.json          the facts (memory.json.bak: before the last consolidation)
   diary.jsonl          one summary a day
   days/0001-spring-04.jsonl   every step shown that day: {"kind", "text", "ok", "data"}, images left out
-  context.json         the planner's messages for the current game day, saved after every turn (screenshots dropped)
+  context.json         the planner's messages for the last finished day (screenshots dropped), a record
   screenshots/         every screenshot the planner takes, full size
 ```
 
-On start, if `context.json` is from the current game day (the last run stopped partway through it), the planner gets its messages back and is told it was restarted and should continue the day, with its memory and the current status; otherwise the day starts fresh with the morning report. Data from before (`~/.local/share/stardew-agent/<save>/`) is moved into the new folder once, if that folder doesn't exist yet.
+The memory and the context reach disk only when a day ends (after the diary and the night's consolidation), as the game itself saves only when you sleep. A run stopped partway through a day starts that day again from its morning report, just as the game starts it again from its morning. Data from before (`~/.local/share/stardew-agent/<save>/`) is moved into the new folder once, if that folder doesn't exist yet.
 
 - `sleep` saves the game. Use a save you don't mind it playing. When the agent exits it leaves the game paused in the menu.
 
@@ -191,19 +193,20 @@ bridge/               the mod (C#): Server, Machine (instructions), Devices (inp
                       Reader, Expr, Views (what read can see), Frames, Journal
 agent/stardew_agent/
   layer 3, the planner
-    brain.py          the planner loop (tools remember, forget, run, wait), context limits, steering
-    director.py       days, the morning report, memory and its nightly consolidation, diary, resuming a day, bedtime
+    brain.py          the planner loop (tools run, wait, screenshot, web, remember, forget), context limits, steering
+    director.py       days, the morning report, memory and its nightly consolidation, diary, saving at the day's end, bedtime
     memory.py         the memory: remember, forget, memory.json, consolidation
     storage.py        the save's data folder: paths, day transcripts, the saved context, moving old data
     prompt.md         the planner's system prompt
     look.py           views of the game (map, find, people, ...), the status line, journal news
   scripts
-    script.py         the runner: budgets, safety, stop_if, exceptions; checks every message from a script
+    script.py         the runner: budgets, safety, exceptions; checks every message from a script
     sdk.py            each SDK function (actions, facts, views), calling a skill below
     wasm_host.py      runs a script in WebAssembly (CPython for WASI under wasmtime)
     sandbox_child.py  the script's side, inside the guest: SDK proxies and exceptions (stdlib only)
   layer 2
     decide.py         span-02: check(), pick(), combat tactics
+    web.py            the web tool's research subagent (TinyFish search and fetch)
   layer 1, the skills
     game.py           the Game core (reading, input, menus left open) and its parts:
       moving.py       walking, travel between places, walking time home

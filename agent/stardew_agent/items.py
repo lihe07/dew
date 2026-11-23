@@ -188,5 +188,5 @@ class Items:
         await self.step(240, {"moved": f"location.name != '{here}'", "menu": "state.menu", "fading": "state.fading"})
         await self.settle()
         if await self.read("menu.choices"):
-            return {"used": item["name"], "note": "it asks a question; answer with dialogue"}
+            return {"used": item["name"], "note": "it asks a question; answer it with answer()"}
         return {"used": item["name"], "now_at": await self.read("location.name")}

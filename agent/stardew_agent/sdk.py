@@ -112,9 +112,9 @@ def clearable(kinds: Any) -> list[str]:
 # Actions which only check their arguments and call a skill; each takes the game where an action takes the context.
 PLAIN: dict[str, Skill] = {
     "harvest": lambda g: work.harvest(g),
-    "water": lambda g, area=None: g.use_tool("watering can", spots(area)) if area else work.water(g),
-    "till": lambda g, area=None, tiles=None: g.use_tool("hoe", spots(area, tiles)),
-    "plant": lambda g, item, area=None, tiles=None: g.place(named(item), spots(area, tiles)),
+    "water": lambda g, area=None: work.water(g, set(spots(area)) if area else None),
+    "till": lambda g, area=None, tiles=None: work.till(g, set(spots(area, tiles))),
+    "plant": lambda g, item, area=None, tiles=None: work.plant(g, named(item), set(spots(area, tiles))),
     "place": lambda g, item, tiles: g.place(named(item), spots(tiles=tiles)),
     "clear": lambda g, area, kinds=None: work.clear(g, box(area), clearable(kinds)),
     "chop": lambda g, area=None, tiles=None: g.use_tool("axe", spots(area, tiles)),
@@ -371,11 +371,5 @@ async def screenshot(ctx: Context, radius: Any = None, grid: Any = False) -> Ima
     return Image(data)
 
 
-async def web(ctx: Context, question: Any) -> str:
-    if not ctx.lookup:
-        raise ActionError("web lookups are off")
-    return await ctx.lookup(text(question, "question"))
-
-
 FACTS = {name: on_game(name, read) for name, read in READS.items()} | {
-    f.__name__: f for f in (energy, minutes_until_2am, people_here, look_map, find, people, item_info, tile_info, screenshot, web)}
+    f.__name__: f for f in (energy, minutes_until_2am, people_here, look_map, find, people, item_info, tile_info, screenshot)}

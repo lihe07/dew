@@ -19,6 +19,7 @@ from .decide import Decider
 from .director import Director
 from .display import Display
 from .tui import TUI
+from .web import Research
 from .driver import BridgeError, Disconnected, Driver, find_session
 from .game import ActionError, Game
 from .look import status
@@ -76,18 +77,14 @@ async def live_status(game: Game) -> dict:
 
 
 def listen(brain: Brain) -> None:
-    """Pass typed lines to the agent. A daemon thread, so a pending read never keeps the program open."""
+    """Pass typed lines to the agent's queue. A daemon thread, so a pending read never keeps the program open."""
     loop = asyncio.get_running_loop()
 
     def read() -> None:
         for line in sys.stdin:
-            text = line.strip()
-            if text.startswith("/later "):
-                loop.call_soon_threadsafe(brain.tell, f"PLAYER: {text[7:].strip()}")
-                loop.call_soon_threadsafe(show, "info", "(the agent gets this when it next wakes)")
-            elif text:
+            if text := line.strip():
                 loop.call_soon_threadsafe(brain.steer, f"PLAYER: {text}")
-                loop.call_soon_threadsafe(show, "info", "(stopping the script and waking the agent with your message)")
+                loop.call_soon_threadsafe(show, "info", "(queued for the planner)")
 
     threading.Thread(target=read, daemon=True, name="stdin").start()
 
@@ -128,6 +125,8 @@ async def play(args: argparse.Namespace) -> None:
         ctx = Context(game, while_idle=lambda stop: combat.keep_busy(game, stop), decide=Decider(key))
         brain = Brain(ctx, api_key=key, model=args.model, system=PROMPT, limits=Limits(turns=args.turns), web=not args.no_web)
         brain.summary_model = args.summary_model
+        if (tinyfish := os.environ.get("TINYFISH_API_KEY")) and not args.no_web:
+            brain.research = Research(brain.client, args.web_model, tinyfish)
         save = SaveData(data_root(args.data), folder)
         said = save.prepare()
         vision.save_to = save.screenshots
@@ -149,7 +148,7 @@ async def play(args: argparse.Namespace) -> None:
         if sys.stdin.isatty():
             listen(brain)
         show("info", f"{args.model} via Respan · save {folder} · {args.days} day(s) · data in {save.dir}")
-        show("info", "type to steer the agent (Enter stops its script; /later TEXT waits until it next wakes) · F8 in the game takes control")
+        show("info", "type a message and Enter to queue it for the planner · F8 in the game takes control")
         await director.play(args.days)
         show("info", await status(game))
     finally:
@@ -160,7 +159,7 @@ async def play_in_panels(args: argparse.Namespace, game: Game, brain: Brain, ctx
     """The full-screen view, with a tab per day; the save's last 7 days are loaded, so they can be looked through."""
     console.print(f"[grey50]{args.model} · {save.folder} · F8 in the game takes control[/]")
     tui = TUI(console, header="F8 takes control")
-    tui.on_steer, tui.on_later = brain.steer, brain.tell
+    tui.on_steer, tui.queued = brain.steer, brain.queued
     tui.load(save.load_days(7))
     director = Director(game, brain, ctx, goal=args.goal, save=save, show=tui.show, memory_model=memory_model, verbose=args.verbose)
     for line in said:
@@ -201,6 +200,7 @@ def main() -> None:
     p.add_argument("--turns", type=int, default=60, help="most model turns per day (default 60)")
     p.add_argument("--speed", type=int, default=1, help="how fast the world runs, single-player only (default 1; faster makes combat reflexes less reliable)")
     p.add_argument("--no-web", action="store_true", help="no web lookups")
+    p.add_argument("--web-model", default="hy4-flash", metavar="MODEL", help="the model of the research helper behind the web tool (default hy4-flash)")
     p.add_argument("--no-map", action="store_true", help="don't print the map after each action")
     commands.add_parser("saves", help="list saves")
     args = parser.parse_args()

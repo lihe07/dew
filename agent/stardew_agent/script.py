@@ -21,7 +21,7 @@ from .driver import BridgeError, Disconnected, HumanControl
 from .game import ActionError, Game, Interrupted
 from .memory import Memory
 from .look import Image, minutes, news, render, status, until_2am
-from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, NotEnough, Question, StopIf, Surprise, TimeToGoHome, Unreachable, Unsure
+from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
 from .sdk import ACTIONS, FACTS, recovers
 
 SURE = 0.6  # the judge's least confidence for an answer to count
@@ -31,10 +31,12 @@ LIMITS = {"fuel": 100_000_000_000, "memory": 256 << 20}  # per script: WebAssemb
 MAX_SOURCE = 20_000  # characters
 MAX_SECONDS = 30 * 60  # real time per script
 MAX_LOGS = 200  # log lines per script
+WAKE_EVERY = 30  # seconds: a script's messages wake the planner at most this often; meanwhile they wait in the queue
+GATHER = 1.0  # seconds a message waits for more, before it wakes the planner
 MAX_TEXT = 500  # characters kept of anything else the script's process says
 MAX_LOG_TEXT = 6000  # characters kept of one log line, enough for a map
 MAX_LOG_CHARS = 40_000  # logged characters per script
-HEARD = {"bubble", "chat", "dialogue", "event", "letter", "level", "message", "question"}  # journal entries stop_if looks at
+HEARD = {"bubble", "chat", "dialogue", "event", "letter", "level", "message", "question"}  # journal entries the judge is shown as recent events
 LOW_HEALTH = 0.3  # of the maximum
 LOW_ENERGY = 15
 HOME_SLACK = 15  # game minutes to spare, arriving home by midnight
@@ -46,14 +48,13 @@ class Context:
 
     game: Game
     memory: Memory = field(default_factory=Memory)  # the planner's lasting facts (remember, forget)
-    lookup: Callable[[str], Awaitable[str]] | None = None
     before_action: Callable[[], Awaitable[None]] | None = None
     shot: dict = field(default_factory=lambda: {"scale": 1.0, "cropped": False})  # the last screenshot's scale, for clicks at its pixels
     finished: bool = False  # the farmer slept: the day is over
     last_night: dict | None = None  # what the night screens showed
     only_tools: set[str] | None = None  # when set, the planner's other tools are refused
     while_idle: Callable[[asyncio.Event], Awaitable[dict]] | None = None  # work done while no script runs, until the event is set
-    decide: Callable[[dict, dict[str, str]], Awaitable[tuple[str | None, float]]] | None = None  # the judge for check, pick, and stop_if
+    decide: Callable[[dict, dict[str, str]], Awaitable[tuple[str | None, float]]] | None = None  # the judge for check and pick
 
 
 @dataclass
@@ -104,7 +105,7 @@ def vet(source: str) -> None:
 
 FAILURES = [
     (Closed, r"\bclosed\b|\blocked\b|festival|isn't around today|didn't open|no shop is open"),
-    (NotEnough, r"inventory is (too )?full|free inventory slot|but you have \d+g|you don't have|missing ingredients|out of energy|isn't in there|is empty|only \d+ of|is there room"),
+    (NotEnough, r"inventory is (too )?full|free inventory slot|but you have \d+g|you don't have|missing ingredients|out of energy|isn't in there|is empty|only \d+ of|is there room|no tilled, empty soil"),
     (Unreachable, r"couldn't reach|no walking route|couldn't get to|lost sight|couldn't catch up|gave up travelling|blocked"),
 ]
 
@@ -181,14 +182,19 @@ class Thing:
     energy: int = 0
     healing: int = 0
     category: str | None = None
+    water: int | None = None  # a watering can's water, and how much it holds
+    water_max: int | None = None
+    upgrade: int | None = None  # a tool's level: 0 basic, 1 copper, 2 steel, 3 gold, 4 iridium
 
     def __str__(self) -> str:
-        return f"{self.name}: x{self.count}" + (f", {self.price}g" if self.price else "") + (f", +{self.energy} energy" if self.energy > 0 else "")
+        return (f"{self.name}" + (f": x{self.count}" if self.count < 1_000_000 else "") + (f", water {self.water}/{self.water_max}" if self.water is not None else "")
+                + (f", {self.price}g" if self.price else "") + (f", +{self.energy} energy" if self.energy > 0 else ""))
 
 
 def thing(row: dict) -> Thing:
     return Thing(row["name"], row.get("stack") or row.get("Stock") or 1, row.get("price") or row.get("Price") or 0, row.get("energy") or 0, row.get("healing") or 0,
-                 row.get("category_name") or (str(row["category"]) if row.get("category") is not None else None))
+                 row.get("category_name") or (str(row["category"]) if row.get("category") is not None else None),
+                 row.get("water"), row.get("water_max"), row.get("upgrade"))
 
 
 def plain(value: Any) -> Any:
@@ -275,7 +281,6 @@ class Script:
 
     source: str
     goal: str
-    stop_if: list[str]
     proc: Any = None
     task: asyncio.Task | None = None
     started: float = 0
@@ -310,8 +315,6 @@ class Runner:
         self._images: list[Image] = []
         self._why: list[str] = []
         self._heard: deque[str] = deque(maxlen=8)
-        self._new = 0  # entries heard since stop_if was last judged
-        self._news = asyncio.Event()
         self._last = ("(none yet)", "")
         self._warned: set[str] = set()  # safety warnings given, until they clear
         self._home: dict = {}  # the last estimate of the walk home
@@ -320,6 +323,10 @@ class Runner:
         self._job: asyncio.Task | None = None
         self._cancel: BaseException | None = None  # what a cancelled action raises
         self._listening = False
+        self._woken_for_messages = -WAKE_EVERY  # when messages last woke the planner
+        self._queued = False  # messages the planner hasn't been woken for
+        self.printed: list[str] = []  # what the script printed, until the planner reads it
+        self._message_timer: asyncio.TimerHandle | None = None
 
     # --- control -------------------------------------------------------------------------------------------
 
@@ -335,7 +342,7 @@ class Runner:
             self.error = None
             self._task = asyncio.create_task(self._main())
 
-    async def run(self, source: str, goal: str, stop_if: list[str] | None = None, finish_current: bool = False) -> str:
+    async def run(self, source: str, goal: str, finish_current: bool = False) -> str:
         """Start a script, replacing the one running. Raises Rejected for a script which won't run."""
         vet(source)
         how = command(self.limits)  # refuse before stopping anything when scripts can't run here
@@ -345,7 +352,8 @@ class Runner:
             await self._stop_script(old, "a new script replaced it", cancel_action=not finish_current, wait=not finish_current)
         proc = await asyncio.create_subprocess_exec(*how, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                                                     env={}, cwd="/", limit=MAX_MESSAGE)
-        script = self.script = Script(source, goal, list(stop_if or []), proc, started=time.monotonic())
+        script = self.script = Script(source, goal, proc, started=time.monotonic())
+        self.emit(Step("script", "started"))
         proc.stdin.write(json.dumps({"source": source}).encode() + b"\n")
         script.task = asyncio.create_task(self._serve(script))
         self._changed.set()
@@ -365,8 +373,6 @@ class Runner:
     def hear(self, entry: dict) -> None:
         if entry.get("kind") in HEARD and entry.get("text"):
             self._heard.append(f"{entry['kind']}: {entry['text'][:200]}")
-            self._new += 1
-            self._news.set()
 
     def describe(self) -> str:
         lines = []
@@ -379,8 +385,12 @@ class Runner:
     def take(self) -> tuple[list[str], list[Image], list[str]]:
         """The trace since the last call, its images, and why the planner was woken."""
         taken = self._trace, self._images, list(dict.fromkeys(self._why))
-        self._trace, self._images, self._why = [], [], []
+        self._trace, self._images, self._why, self.printed = [], [], [], []
         return taken
+
+    def wake(self, why: str) -> None:
+        """Wake the planner for something outside the script (the player's message)."""
+        self._wake(why)
 
     # --- serving a script ----------------------------------------------------------------------------------
 
@@ -416,7 +426,10 @@ class Runner:
                     script.chars += len(logged := text_of(message["log"], MAX_LOG_TEXT))
                     if script.chars > MAX_LOG_CHARS:
                         raise Kill(f"it logged over {MAX_LOG_CHARS} characters")
-                    self._note("log: " + logged, "log")
+                    self._note("printed: " + logged, "log")
+                    self.printed.append(logged)
+                    self._queued = True
+                    self._wake_for_messages()
                 elif "call" in message:
                     if script.calls > MAX_CALLS + 20:  # it keeps calling past its budget
                         raise Kill(f"it went on calling after {MAX_CALLS} calls")
@@ -458,8 +471,6 @@ class Runner:
         try:
             if script.calls > MAX_CALLS:
                 raise Surprise(f"budget: the script made over {MAX_CALLS} calls")
-            if hit := await self._stop_if(script):
-                raise hit
             return {"value": await self._sdk(script, name, args, kwargs)}
         except Surprise as ex:
             return {"raise": type(ex).__name__, "args": list(ex.args)}
@@ -530,8 +541,13 @@ class Runner:
     def _ended(self, script: Script) -> None:
         """A script's process is gone: tell the planner how it ended, unless it was stopped on purpose."""
         script.done.set()
+        self.emit(Step("script", "ended"))
         if self.script is script:
             self.script = None
+        self._queued = False  # its messages go with this wake-up
+        if self._message_timer:
+            self._message_timer.cancel()
+            self._message_timer = None
         how, *rest = script.outcome or ("killed", "it ended without saying how")
         if how == "done":
             self._wake("the script ended")
@@ -559,6 +575,19 @@ class Runner:
         self._trace.append(line)
         self.emit(Step(kind, line, ok))
 
+    def _wake_for_messages(self) -> None:
+        """A script's messages wake the planner, which reads them all: after a moment (so a burst comes as one, and a script
+        which ends meanwhile wakes it just once), and not more often than WAKE_EVERY."""
+        if self._queued and not self._message_timer:
+            wait = max(GATHER, self._woken_for_messages + WAKE_EVERY - time.monotonic())
+            self._message_timer = asyncio.get_running_loop().call_later(wait, self._messages_due)
+
+    def _messages_due(self) -> None:
+        self._message_timer = None
+        if self.script and self._queued:
+            self._woken_for_messages, self._queued = time.monotonic(), False
+            self._wake("the script sent messages (it's still running)")
+
     def _wake(self, why: str) -> None:
         self._why.append(why)
         self.emit(Step("wake", why))
@@ -572,7 +601,7 @@ class Runner:
                 await self.script.done.wait()
 
     async def _act(self, script: Script, name: str, args: list, kwargs: dict) -> Any:
-        """Run one action for a script, keeping watch for safety and stop_if meanwhile. Returns its result; raises a Surprise, TypeError, or Stopped."""
+        """Run one action for a script, keeping watch for safety meanwhile. Returns its result; raises a Surprise, TypeError, or Stopped."""
         call = inspect.signature(ACTIONS[name]).bind(self.ctx, *args, **kwargs)  # a TypeError for the script
         given = dict(list(call.arguments.items())[1:])
         async with self._lock:
@@ -589,14 +618,12 @@ class Runner:
             self._job = asyncio.create_task(self._perform(name, call))
             try:
                 while not self._job.done():
-                    heard = asyncio.ensure_future(self._news.wait())
-                    await asyncio.wait({self._job, heard}, timeout=self.poll, return_when=asyncio.FIRST_COMPLETED)
-                    heard.cancel()
+                    await asyncio.wait({self._job}, timeout=self.poll)
                     if self._job.done():
                         break
                     if self._overtime(script):
                         self._cancel = Stopped(script.stopped)
-                    elif hit := await self._danger(name, given) or await self._stop_if(script):
+                    elif hit := await self._danger(name, given):
                         self._cancel = hit
                     if self._cancel:
                         self._job.cancel()
@@ -611,9 +638,12 @@ class Runner:
                 raised = self._cancel or Stopped("stopped")
                 self._record(job, Outcome(f"stopped partway: {type(raised).__name__}: {raised}", ok=False))
                 raise raised
-            if isinstance(ex := self._job.exception(), (HumanControl, Disconnected)):
+            if isinstance(ex := self._job.exception(), HumanControl):
+                self._wake("the player took control")  # the planner pauses until it's given back
+                raise script.stop("the player took control")
+            if isinstance(ex, Disconnected):
                 self.error = ex
-                raise script.stop("the player took control" if isinstance(ex, HumanControl) else "the game went away")
+                raise script.stop("the game went away")
             if ex:  # the report after the action failed
                 outcome, value, raised = Outcome(f"ERROR: {type(ex).__name__}: {ex}", ok=False), None, failure(f"{type(ex).__name__}: {ex}")
             else:
@@ -682,19 +712,6 @@ class Runner:
             except ActionError as ex:
                 raise failure(str(ex)) from None
             return await self.ctx.game.shop_stock()
-
-    async def _stop_if(self, script: Script) -> Surprise | None:
-        """A stop_if situation which happened since the last check, judged only when something new was said or shown."""
-        self._news.clear()
-        if not script.stop_if or not self._new:
-            return None
-        self._new = 0
-        i, sure = await self.judge.which(script.stop_if)
-        if i is None or sure < SURE:
-            return None
-        situation = script.stop_if.pop(i)
-        self._note(f"stop_if {situation!r} ({sure:.2f})", "judge")
-        return StopIf(situation)
 
     async def _danger(self, name: str, args: dict) -> Surprise | None:
         """Low health, low energy, or the time to head home, each raised once until it clears. Actions which cure it may run."""

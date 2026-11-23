@@ -9,8 +9,8 @@ from stardew_agent.look import news, render
 from stardew_agent.script import Context
 
 
-def test_the_planner_sees_four_described_tools():
-    assert [t["name"] for t in planner.TOOLS] == ["remember", "forget", "run", "wait"]
+def test_the_planner_sees_six_described_tools():
+    assert [t["name"] for t in planner.TOOLS] == ["remember", "forget", "run", "screenshot", "web", "wait"]
     for t in planner.TOOLS:
         assert t["description"] and t["input_schema"]["type"] == "object"
 
@@ -76,3 +76,54 @@ def test_place_names():
     g.d = FakeDriver()
     names = {n: asyncio.run(g.location_name(n)) for n in ["Wizard Tower", "AdventurerGuild", "the beach", "pierre's", "Nowhere"]}
     assert names == {"Wizard Tower": "WizardHouse", "AdventurerGuild": "AdventureGuild", "the beach": "Beach", "pierre's": "SeedShop", "Nowhere": "Nowhere"}
+
+
+def test_the_view_says_a_script_ended_however_it_ended():
+    import os
+    from rich.console import Console
+    from stardew_agent.tui import TUI
+    t = TUI(Console(file=open(os.devnull, "w")))
+    t.show("day", "Mon spring 1, year 1")
+    t.show("plan", "started", {"script": "wait_until('8:50 am')", "goal": "wait for Pierre"})
+    t.show("script", "started")
+    assert "Script running" in t._activity(t.days[-1], True).plain
+    t.show("script", "ended")  # replaced, stopped by the player, or finished: no wake-up text needed
+    assert "Idle" in t._activity(t.days[-1], True).plain
+
+
+def test_the_web_tool_asks_the_research_helper_which_searches_and_reads():
+    import asyncio
+    from types import SimpleNamespace as NS
+    from stardew_agent.web import Research
+
+    class Model:
+        """Searches, then reads the first result, then answers."""
+        def __init__(self):
+            self.calls = []
+            self.messages = self
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            step = len(self.calls)
+            if step == 1:
+                return NS(content=[NS(type="tool_use", id="s", name="search", input={"query": "Haley loved gifts", "site": "stardewvalleywiki.com"}, model_dump=lambda: {"type": "tool_use", "id": "s", "name": "search", "input": {}})])
+            if step == 2:
+                return NS(content=[NS(type="tool_use", id="f", name="fetch", input={"url": "https://stardewvalleywiki.com/Haley", "find": "Loved Gifts"}, model_dump=lambda: {"type": "tool_use", "id": "f", "name": "fetch", "input": {}})])
+            return NS(content=[NS(type="text", text="Haley loves Coconut, Fruit Salad, Pink Cake, and Sunflower.")])
+
+    r = Research(Model(), "hy4-flash", "key")
+    seen = []
+
+    async def search(query, site=None):
+        seen.append(("search", query, site))
+        return "Haley - Stardew Valley Wiki — https://stardewvalleywiki.com/Haley"
+
+    async def fetch(url, find=None):
+        seen.append(("fetch", url, find))
+        return "Loved Gifts | Coconut Fruit Salad Pink Cake Sunflower"
+
+    r.search, r.fetch = search, fetch
+    answer, did = asyncio.run(r.answer("What does Haley love?"))
+    assert answer.startswith("Haley loves Coconut") and seen == [("search", "Haley loved gifts", "stardewvalleywiki.com"), ("fetch", "https://stardewvalleywiki.com/Haley", "Loved Gifts")]
+    assert all(c["model"] == "hy4-flash" and c["thinking"] == {"type": "disabled"} for c in r.client.calls)
+    assert "What does Haley love?" in r.client.calls[0]["messages"][0]["content"] and len(did) == 2

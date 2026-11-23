@@ -87,26 +87,25 @@ class Cutscene(Happened):
     pass
 
 
-class StopIf(Happened):
-    fields = ("situation",)
-
-
 class Ask(BaseException):
     """The script asked the planner something; it ends here."""
 
 
 EXCEPTIONS: dict[str, type[Exception]] = {c.__name__: c for c in (Surprise, ActionFailed, Unreachable, NotEnough, Closed, Unsure, Danger, LowHealth, LowEnergy, TimeToGoHome,
-                                                                   Happened, Question, Cutscene, StopIf)}
+                                                                   Happened, Question, Cutscene)}
 REPLY_ERRORS = {**EXCEPTIONS, "TypeError": TypeError, "ValueError": ValueError}
 
 
 # --- talking to the parent ---------------------------------------------------------------------------------
 
 
+UNLIMITED = 1_000_000
+
+
 class Item:
     """An item as scripts see it; read-only."""
 
-    __slots__ = ("name", "count", "price", "energy", "healing", "category")
+    __slots__ = ("name", "count", "price", "energy", "healing", "category", "water", "water_max", "upgrade")
 
     def __init__(self, fields: dict):
         for key in self.__slots__:
@@ -116,7 +115,8 @@ class Item:
         raise AttributeError("items are read-only")
 
     def __repr__(self) -> str:
-        return f"Item({self.name} x{self.count})"
+        count = f" x{self.count}" if self.count and self.count < UNLIMITED else ""  # shops sell some things without limit
+        return f"Item({self.name}{count}" + (f", water {self.water}/{self.water_max}" if self.water is not None else "") + ")"
 
     def wire(self) -> dict:
         return {"item": {k: getattr(self, k) for k in self.__slots__}}
@@ -146,7 +146,7 @@ class Channel:
 SDK = ["go", "harvest", "water", "till", "plant", "place", "clear", "chop", "break_rocks", "forage", "pet", "machines", "fish", "mine", "fight", "rewards",
        "buy", "sell", "eat", "ship", "use", "craft", "trash", "hold", "put", "take", "talk", "answer", "skip_cutscene", "wait_until", "soak", "sleep", "screen",
        "money", "time", "minutes_until_2am", "health", "energy", "here", "people_here", "shop_stock", "check",
-       "state", "look_map", "find", "people", "quests", "recipes", "item_info", "exits", "tile_info", "screenshot", "web"]
+       "state", "look_map", "find", "people", "quests", "recipes", "item_info", "exits", "tile_info", "screenshot"]
 
 
 def namespace(channel: Channel) -> dict[str, Any]:
@@ -164,13 +164,14 @@ def namespace(channel: Channel) -> dict[str, Any]:
         options = list(options)
         return options[channel.call("pick", (description, options), {})]
 
-    def log(*parts: Any, **_: Any) -> None:
-        channel.send({"log": " ".join(str(p) for p in parts)})
+    def print_(*parts: Any, sep: str = " ", **_: Any) -> None:
+        """print: a message to the planner, which wakes it."""
+        channel.send({"log": str(sep).join(str(p) for p in parts)})
 
     def ask(question: str) -> None:
         raise Ask(str(question))
 
-    return {**{name: proxy(name) for name in SDK}, "backpack": Backpack(), "pick": pick, "log": log, "ask": ask, **EXCEPTIONS}
+    return {**{name: proxy(name) for name in SDK}, "backpack": Backpack(), "pick": pick, "print": print_, "ask": ask, **EXCEPTIONS}
 
 
 # --- running ----------------------------------------------------------------------------------------------
@@ -185,7 +186,7 @@ def main() -> None:
         channel.send({"error": "SyntaxError", "message": str(ex.msg), "line": ex.lineno or 0, "source_line": (ex.text or "").strip()})
         return
     sdk = namespace(channel)
-    globals_ = {"__name__": "__script__", **sdk, "print": sdk["log"]}
+    globals_ = {"__name__": "__script__", **sdk}
     try:
         exec(code, globals_)
     except Ask as ex:

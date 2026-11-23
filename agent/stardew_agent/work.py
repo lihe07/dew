@@ -43,15 +43,17 @@ async def layer(g: Game, name: str) -> list[Tile]:
 # --- farming -----------------------------------------------------------------------------------------------
 
 
-async def water(g: Game) -> dict:
+async def water(g: Game, within: set[Tile] | None = None) -> dict:
+    """Water the crops which need it (only those within the given tiles, if any), refilling the can at water nearby."""
     await g.ready()
     watered = 0
 
     async def dry() -> list[Tile]:
-        return await tiles(g, "terrain", "thirsty")
+        found = await tiles(g, "terrain", "thirsty")
+        return [t for t in found if within is None or t in within]
 
     if not await dry():
-        return {"watered": 0, "note": "nothing needs water here"}
+        return {"watered": 0, "note": "nothing needs water " + ("in that area" if within else "here")}
     await g.hold_tool("watering can")
 
     async def act(tile: Tile) -> None:
@@ -65,6 +67,29 @@ async def water(g: Game) -> dict:
     with progress(lambda: f"watered {watered}"):
         failed = await g.for_nearest(dry, act)
     return {"watered": watered, "still_dry": len(await dry()), **g.unreached(failed)}
+
+
+async def till(g: Game, within: set[Tile]) -> dict:
+    """Hoe the bare ground among these tiles; tiles already tilled, planted, or covered are left alone."""
+    await g.ready()
+    diggable = set(await layer(g, "dig"))
+    covered = set(await tiles(g, "terrain", "x >= 0")) | set(await tiles(g, "object_rows", "x >= 0"))
+    todo = sorted(t for t in within if t in diggable and t not in covered)
+    if not todo:
+        tilled = len([t for t in within if t in set(await tiles(g, "terrain", "kind == 'dirt'"))])
+        return {"tilled": 0, "note": f"nothing to till there ({tilled} of {len(within)} tiles already tilled; the rest can't be dug or are covered)"}
+    result = await g.use_tool("hoe", todo)
+    return {**result, "skipped": len(within) - len(todo)} if isinstance(result, dict) else result
+
+
+async def plant(g: Game, item: str, within: set[Tile]) -> dict:
+    """Plant seeds (or place fertilizer) on the tilled, empty soil among these tiles."""
+    await g.ready()
+    empty = set(await tiles(g, "terrain", "kind == 'dirt' and crop == null")) - set(await tiles(g, "object_rows", "x >= 0"))
+    todo = sorted(t for t in within if t in empty)
+    if not todo:
+        raise ActionError(f"no tilled, empty soil among those {len(within)} tiles: till them first, or pick other tiles")
+    return {**await g.place(item, todo), "skipped": len(within) - len(todo)}
 
 
 async def refill(g: Game) -> None:

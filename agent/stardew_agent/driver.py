@@ -156,7 +156,7 @@ class Driver:
             raise Disconnected("lost the connection to the game") from None
         finally:
             self._waiting.pop(message["id"], None)
-        if message.get("lane") != "read":  # quick reads don't report who has control
+        if message.get("lane") != "read" or "human" in reply:  # every reply says who has control (reads too, so it's noticed within a second)
             self.human = bool(reply.get("human"))
         for entry in reply.get("journal", []):
             for listener in self.on_journal:

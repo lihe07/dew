@@ -38,8 +38,8 @@ def test_sdk_calls_reach_their_actions(make_runner, acts, source, args):
 
 def test_a_call_of_the_wrong_shape_raises_type_error(make_runner, acts):
     r, _ = make_runner()
-    why = asyncio.run(run_script(r, "try:\n    fish(3, 4)\nexcept TypeError as e:\n    log('wrong:', e)\nmoney(1)"))
-    assert not acts.log and why == ["the script raised TypeError at line 5"] and any(t.startswith("log: wrong:") for t in r.trace)
+    why = asyncio.run(run_script(r, "try:\n    fish(3, 4)\nexcept TypeError as e:\n    print('wrong:', e)\nmoney(1)"))
+    assert not acts.log and why == ["the script raised TypeError at line 5"] and any(t.startswith("printed: wrong:") for t in r.trace)
 
 
 def test_actions_return_their_results_and_facts_read_live(make_runner, acts):
@@ -47,9 +47,9 @@ def test_actions_return_their_results_and_facts_read_live(make_runner, acts):
     values = {"player.money": 1840, "time.clock": 1430, "location.name": "Beach", "location.npcs": [{"name": "Willy"}], "player.free_slots": 0,
               "inventory": [{"name": "Carp", "stack": 3, "price": 30, "energy": 13, "category": -4}, {"name": "Wood", "stack": 50, "price": 2}]}
     r, _ = make_runner(values=values)
-    asyncio.run(run_script(r, "got = fish()\nlog(got['caught'], money(), time(), minutes_until_2am(), here(), people_here())\n"
-                              "log([f.name for f in backpack.fish], [f.name for f in backpack.food], backpack.free, backpack.full, backpack.items[1].count)"))
-    assert "log: 2 1840 1430 690 Beach ['Willy']" in r.trace and "log: ['Carp'] ['Carp'] 0 True 50" in r.trace
+    asyncio.run(run_script(r, "got = fish()\nprint(got['caught'], money(), time(), minutes_until_2am(), here(), people_here())\n"
+                              "print([f.name for f in backpack.fish], [f.name for f in backpack.food], backpack.free, backpack.full, backpack.items[1].count)"))
+    assert "printed: 2 1840 1430 690 Beach ['Willy']" in r.trace and "printed: ['Carp'] ['Carp'] 0 True 50" in r.trace
 
 
 def test_check_is_true_false_or_unsure(make_runner, acts):
@@ -95,9 +95,9 @@ def test_interruptions_become_questions_or_cutscenes():
 def test_caught_and_uncaught_exceptions(make_runner, acts):
     acts.errors["buy"] = "the shop is closed: SeedShop opens at 9am"
     r, _ = make_runner()
-    why = asyncio.run(run_script(r, "try:\n    buy('Parsnip Seeds')\nexcept Closed as e:\n    log('closed:', e.reason)\n    go('JojaMart')\n    buy('Parsnip Seeds')\nfish()"))
+    why = asyncio.run(run_script(r, "try:\n    buy('Parsnip Seeds')\nexcept Closed as e:\n    print('closed:', e.reason)\n    go('JojaMart')\n    buy('Parsnip Seeds')\nfish()"))
     assert names(acts) == ["buy", "go", "buy"] and why == ["the script raised Closed at line 6"]
-    assert "log: closed: the shop is closed: SeedShop opens at 9am" in r.trace
+    assert "printed: closed: the shop is closed: SeedShop opens at 9am" in r.trace
     assert any(t.startswith("#1 buy") and "FAILED" in t for t in r.trace)
     assert "Closed: the shop is closed: SeedShop opens at 9am\n  at line 6: buy('Parsnip Seeds')" in text(r)
 
@@ -115,8 +115,8 @@ def test_danger_is_raised_between_calls_and_mid_action(make_runner, acts):
         await until(lambda: r.current is not None)
         ctx.game.values["player.energy"] = 10
 
-    why = asyncio.run(run_script(r, "try:\n    fish(20)\nexcept LowEnergy as e:\n    log('tired', e)\nfish(20)", timeout=4, during=tire))
-    assert "log: tired energy is low (10)" in r.trace and ctx.game.released
+    why = asyncio.run(run_script(r, "try:\n    fish(20)\nexcept LowEnergy as e:\n    print('tired', e)\nfish(20)", timeout=4, during=tire))
+    assert "printed: tired energy is low (10)" in r.trace and ctx.game.released
     assert names(acts) == ["fish", "fish"] and why == ["the script ended"]  # raised once, then the script went on
 
 
@@ -127,22 +127,8 @@ def test_time_to_go_home_is_computed_once(make_runner, acts):
         return 90
 
     ctx.game.minutes_home = minutes_home
-    why = asyncio.run(run_script(r, "try:\n    fish()\nexcept TimeToGoHome as e:\n    log(e.minutes_home, e.minutes_left)\n    go('Farm')\n    sleep()"))
-    assert "log: 90 135" in r.trace and names(acts) == ["go", "sleep"] and why == ["the script ended"]
-
-
-def test_stop_if_is_raised_mid_action(make_runner, acts):
-    acts.seconds["mine"] = 2
-    r, ctx = make_runner(decide=judge(("case0", 0.9)))
-
-    async def ask():
-        await until(lambda: r.current is not None)
-        assert not ctx.decide.asked  # nothing was said yet
-        ctx.game.say("dialogue", "Abigail: Can you help me?")
-
-    why = asyncio.run(run_script(r, "mine()\nfight()", stop_if=["someone asks the farmer for help"], during=ask))
-    assert names(acts) == ["mine"] and why == ["the script raised StopIf at line 1"] and ctx.game.released
-    assert "Abigail: Can you help me?" in ctx.decide.states[0]["recent_events"][0]
+    why = asyncio.run(run_script(r, "try:\n    fish()\nexcept TimeToGoHome as e:\n    print(e.minutes_home, e.minutes_left)\n    go('Farm')\n    sleep()"))
+    assert "printed: 90 135" in r.trace and names(acts) == ["go", "sleep"] and why == ["the script ended"]
 
 
 def test_stopped_cant_be_caught_and_a_new_run_replaces_the_old(make_runner, acts):
@@ -158,9 +144,9 @@ def test_stopped_cant_be_caught_and_a_new_run_replaces_the_old(make_runner, acts
             said.append(await r.run("fish()", "new", finish_current=finish))
             await until(lambda: r.script is None and r.current is None and old.done.is_set())
 
-        why = asyncio.run(run_script(r, "try:\n    mine()\n    mine()\nexcept Exception:\n    log('caught it')\nfight()", during=replace))
+        why = asyncio.run(run_script(r, "try:\n    mine()\n    mine()\nexcept Exception:\n    print('caught it')\nfight()", during=replace))
         assert said[0].startswith("stopped the previous script")
-        assert names(acts) == ["mine", "fish"] and "log: caught it" not in r.trace
+        assert names(acts) == ["mine", "fish"] and "printed: caught it" not in r.trace
         assert any("the script stopped at line" in t for t in r.trace) and why == ["the script ended"]
         assert ctx.game.released != finish
 
@@ -181,18 +167,18 @@ def test_ask_ends_the_script_and_asks(make_runner, acts):
     assert names(acts) == ["fish"] and why == ["the script asks: Should I buy the backpack?"]
 
 
-@pytest.mark.parametrize("source, reason", [("x = [", "line 1: SyntaxError"), ("if True:\nlog(1)", "line 2: SyntaxError"), ("x = 1\n" * 5000, "longer than 20000")])
+@pytest.mark.parametrize("source, reason", [("x = [", "line 1: SyntaxError"), ("if True:\nprint(1)", "line 2: SyntaxError"), ("x = 1\n" * 5000, "longer than 20000")])
 def test_scripts_which_arent_python_are_rejected(source, reason):
     with pytest.raises(Rejected, match=re.escape(reason)):
         vet(source)
 
 
 def test_scripts_are_ordinary_python(make_runner, acts):
-    source = ("import json, math, itertools\nclass Plan:\n    steps = 2\nmatch Plan.steps:\n    case 2:\n        log(json.dumps({'k': math.floor(2.5)}))\n"
-              "log(sum(x for x in range(4)), list(itertools.islice(range(9), 2)))\nwith open('/lib/python3.15/os.py') as f:\n    log(f.readline()[:3])")
+    source = ("import json, math, itertools\nclass Plan:\n    steps = 2\nmatch Plan.steps:\n    case 2:\n        print(json.dumps({'k': math.floor(2.5)}))\n"
+              "print(sum(x for x in range(4)), list(itertools.islice(range(9), 2)))\nwith open('/lib/python3.15/os.py') as f:\n    print(f.readline()[:3])")
     r, _ = make_runner()
     why = asyncio.run(run_script(r, source, timeout=8))
-    assert why == ["the script ended"] and 'log: {"k": 2}' in r.trace and "log: 6 [0, 1]" in r.trace
+    assert why == ["the script ended"] and 'printed: {"k": 2}' in r.trace and "printed: 6 [0, 1]" in r.trace
 
 
 def test_idle_work_runs_while_no_script_does(make_runner, acts):
@@ -224,11 +210,11 @@ def test_idle_work_runs_while_no_script_does(make_runner, acts):
 
 def test_the_planner_gets_rejections_and_wake_ups(make_brain, acts):
     acts.seconds["mine"] = 0.3
-    b, ctx, sent = make_brain([reply(run_call("x = [")), reply(run_call("mine()\nlog('done')", id="c2"))])
+    b, ctx, sent = make_brain([reply(run_call("x = [")), reply(run_call("mine()\nprint('done')", id="c2"))])
     asyncio.run(play(b))
     assert "run rejected, nothing changed: line 1: SyntaxError" in json.dumps(sent[1].messages[-1]["content"])
     woken = last_text(sent[2])
-    assert "#1 mine:\ndone\n[Mon spring 3 9:00 am | Farm (1,2)" in woken and "log: done" in woken and "Woken because: the script ended" in woken
+    assert "#1 mine:\ndone\n[Mon spring 3 9:00 am | Farm (1,2)" in woken and "printed: done" in woken and "Woken because: the script ended" in woken
 
 
 def test_a_look_script_answers_in_the_wake_up(make_brain, acts, monkeypatch):
@@ -240,32 +226,30 @@ def test_a_look_script_answers_in_the_wake_up(make_brain, acts, monkeypatch):
 
     monkeypatch.setattr(look, "tile_map", tile_map)
     monkeypatch.setattr(vision, "capture", capture)
-    source = "print(look_map(8))\nscreenshot(radius=6)\ntry:\n    find('dragons')\nexcept TypeError as e:\n    print('no:', e)\ntry:\n    web('What does Robin love?')\nexcept ActionFailed as e:\n    print(e.reason)"
+    source = "print(look_map(8))\nscreenshot(radius=6)\ntry:\n    find('dragons')\nexcept TypeError as e:\n    print('no:', e)"
     b, ctx, sent = make_brain([reply(run_call(source))])
     asyncio.run(play(b))
     woken = sent[1].messages[-1]["content"]
     said = last_text(sent[1])
-    assert "log: location: Farm\nmap: radius 8: @..~" in said and "log: no: find's kind is one of" in said and "log: web lookups are off" in said
+    assert "printed: location: Farm\nmap: radius 8: @..~" in said and "printed: no: find's kind is one of" in said
     assert "Woken because: the script ended" in said and not acts.log
     assert [c["source"]["data"] for c in woken if c["type"] == "image"] == ["IMG"] and ctx.shot["scale"] == 0.5
 
 
-def test_the_prompt_example_is_python():
+def test_the_prompt_examples_are_python_using_only_the_sdk():
+    import ast
+    import builtins
+    from stardew_agent import sandbox_child
     prompt = (Path(script.__file__).parent / "prompt.md").read_text()
-    vet(re.search(r"Example:\n```\n(.*?)```", prompt, re.S)[1])
-
-
-def test_stop_if_is_raised_at_the_next_call(make_runner, acts):
-    answers = iter([("case0", 0.9), ("case0", 0.9)])
-
-    async def decide(state, options):
-        if "case0" in options and options["case0"] == "it is raining":
-            ctx.game.say("message", "A festival starts in town!")  # something is shown while the script thinks
-        return next(answers)
-
-    r, ctx = make_runner(decide=decide)
-    why = asyncio.run(run_script(r, "if check('it is raining'):\n    fight()", stop_if=["a festival is starting"]))
-    assert not acts.log and why == ["the script raised StopIf at line 2"]
+    examples = re.findall(r"Example:\n```\n(.*?)```", prompt, re.S)
+    known = set(sandbox_child.SDK) | {"backpack", "pick", "print", "ask"} | set(sandbox_child.EXCEPTIONS) | set(dir(builtins))
+    assert len(examples) >= 3
+    for source in examples:
+        vet(source)
+        tree = ast.parse(source)
+        assigned = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        assert used <= known | assigned, used - known - assigned
 
 
 # --- WebAssembly isolation -----------------------------------------------------------------------------------
@@ -289,7 +273,7 @@ def test_the_guest_cant_reach_the_host(make_runner, acts):
     """Nothing in Python stops these; WebAssembly does."""
     probe = "results = {}\n" + "".join(
         f"try:\n    {code}\n    results[{name!r}] = 'ALLOWED'\nexcept BaseException as ex:\n    results[{name!r}] = type(ex).__name__\n" for name, code in ESCAPES.items()
-    ) + "log(results)"
+    ) + "print(results)"
     r, _ = make_runner()
     why = asyncio.run(run_script(r, probe, timeout=10))
     assert why == ["the script ended"]
@@ -322,10 +306,10 @@ def test_waiting_for_an_action_costs_no_fuel(make_runner, acts):
 def test_startup_with_the_compiled_cache_is_quick(make_runner, acts):
     import time
     r, _ = make_runner()
-    asyncio.run(run_script(r, "log(1)", timeout=10))  # makes sure the cache exists
+    asyncio.run(run_script(r, "print(1)", timeout=10))  # makes sure the cache exists
     started = time.monotonic()
     r, _ = make_runner()
-    asyncio.run(run_script(r, "log(1)", timeout=10))
+    asyncio.run(run_script(r, "print(1)", timeout=10))
     assert time.monotonic() - started < 1.5
 
 
@@ -333,7 +317,7 @@ def test_without_webassembly_scripts_are_refused(make_runner, acts, monkeypatch)
     monkeypatch.setattr(script.wasm_host, "WASM", script.wasm_host.ROOT / "missing.wasm")
     r, _ = make_runner()
     with pytest.raises(Rejected, match="just setup-wasm"):
-        asyncio.run(r.run("log(1)", "test"))
+        asyncio.run(r.run("print(1)", "test"))
 
 
 def test_a_stopped_scripts_process_is_gone(make_runner, acts):
@@ -380,3 +364,27 @@ def test_a_stopped_script_gets_nothing_more_done(make_runner, acts):
 
     asyncio.run(go())
     assert not opened and not acts.log
+
+
+def test_a_log_wakes_the_planner_while_the_script_runs(make_runner, acts, monkeypatch):
+    monkeypatch.setattr(script, "WAKE_EVERY", 0.3)
+    monkeypatch.setattr(script, "GATHER", 0.05)
+    acts.seconds["fish"] = 0.8
+    r, _ = make_runner()
+
+    async def go():
+        r.start()
+        await r.run("print('a treasure chest!')\nprint('and a second one')\nfish(3)\nprint('later')\nfish(3)", "test")
+        await until(lambda: r._why)  # woken a moment after the two messages, as one
+        trace, _, why = r.take()
+        assert why == ["the script sent messages (it's still running)"] and r.script is not None
+        assert "printed: a treasure chest!" in trace
+        await until(lambda: "printed: later" in r._trace, 3)
+        await until(lambda: r._why, 3)  # once the gap since the last wake-up has passed
+        _, _, again = r.take()
+        await until(lambda: r.script is None, 3)
+        await r.halt("test over")
+        return again
+
+    assert asyncio.run(go()) == ["the script sent messages (it's still running)"]
+

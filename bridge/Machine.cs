@@ -168,7 +168,7 @@ internal sealed class Machine
         while (this.Client != null && this.Client.Reads.TryDequeue(out JObject? request))
         {
             var results = new JArray();
-            var message = new JObject { ["id"] = request["id"], ["results"] = results };
+            var message = new JObject { ["id"] = request["id"], ["results"] = results, ["human"] = this.Human };
             try
             {
                 foreach (JToken op in request["ops"] as JArray ?? new JArray())

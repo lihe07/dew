@@ -11,7 +11,10 @@ from typing import Any
 import anthropic
 
 from .decide import GATEWAY
+from .web import Research
+from .driver import BridgeError
 from .game import ActionError
+from . import look, sdk
 from .look import news, status
 from .memory import MAX_KEY, MAX_VALUE
 from .script import Context, Outcome, Rejected, Runner, Step
@@ -22,17 +25,19 @@ REMEMBER = {"name": "remember", "description": "Keep a fact for future days, by 
                 "value": {"type": "string", "maxLength": MAX_VALUE, "description": "The fact, as short text"}}}}
 FORGET = {"name": "forget", "description": "Remove a fact from your memory, once it's stale or wrong.",
           "input_schema": {"type": "object", "additionalProperties": False, "required": ["key"], "properties": {"key": {"type": "string", "maxLength": MAX_KEY}}}}
-RUN = {"name": "run", "description": "Run a script (Python with the SDK) in the background while you think. It replaces the running script; the running action is stopped unless finish_current is true. You're woken when the script ends, raises, or asks.",
+RUN = {"name": "run", "description": "Run a script (Python with the SDK) in the background while you think. It replaces the running script at once, stopping its action unless finish_current is true: to change course, just run the new plan. You're woken when the script ends, raises, or asks.",
        "input_schema": {"type": "object", "required": ["script", "goal"], "properties": {
            "script": {"type": "string", "description": "Python using the SDK"}, "goal": {"type": "string", "maxLength": 300},
-           "stop_if": {"type": "array", "items": {"type": "string"}, "maxItems": 6, "description": "Situations judged when something new is said or shown; a match raises StopIf in the script"},
            "finish_current": {"type": "boolean", "description": "Let the running action finish first"}}}}
+SCREENSHOT = {"name": "screenshot", "description": "See the game screen now, with people, exits, and objects labelled name (x,y). It doesn't disturb the running script.",
+              "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+                  "radius": {"type": "integer", "minimum": 2, "maximum": 20, "description": "Crop to this many tiles around the farmer"},
+                  "grid": {"type": "boolean", "description": "Overlay tile coordinates"}}}}
+WEB = {"name": "web", "description": "Ask a research helper a question about the game; it searches the web and reads the wiki, then answers in a few sentences. It takes a few seconds and costs a little, so remember what you learn.",
+       "input_schema": {"type": "object", "additionalProperties": False, "required": ["question"], "properties": {"question": {"type": "string", "maxLength": 400}}}}
 WAIT = {"name": "wait", "description": "Let the script run and end your turn. You're woken when it ends or needs you.", "input_schema": {"type": "object", "properties": {}}}
-TOOLS = [REMEMBER, FORGET, RUN, WAIT]
-SERVER_TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
-]
+TOOLS = [REMEMBER, FORGET, RUN, SCREENSHOT, WEB, WAIT]
+MAP_RADIUS = 10  # tiles each way in the map at every wake-up
 
 
 class OutOfBudget(Exception):
@@ -72,7 +77,6 @@ class Brain:
         self.summary_model: str | None = None
         self.inbox: list[str] = []
         self.stop_reason: str | None = None
-        self.on_context: Callable[[list[dict]], None] | None = None  # called with the messages whenever the planner's turn is complete
         self.client = anthropic.AsyncAnthropic(api_key=api_key, base_url=base_url, max_retries=4, timeout=180)
         self.is_claude = "claude" in model
         self.lookups = 0
@@ -80,8 +84,7 @@ class Brain:
         self._wake = asyncio.Event()  # the runner needs the planner
         self._poke = asyncio.Event()  # the player steered, or the director ended the turn
         self.runner = Runner(ctx, self._steps.put_nowait, self._wake.set)
-        if web:
-            ctx.lookup = self.lookup
+        self.research: Research | None = None  # set by whoever has the TinyFish key
 
     def reset(self) -> None:
         self.messages.clear()
@@ -90,13 +93,19 @@ class Brain:
         self.runner.count = 0
 
     def tell(self, text: str) -> None:
-        """Queue a message for the planner's next wake-up, without interrupting anything."""
+        """Queue a message for the planner's next wake-up, without waking it (the director's notes)."""
         self.inbox.append(text)
 
     def steer(self, text: str) -> None:
-        """Deliver a message now: stop the script and its action, and wake the planner with it."""
+        """The player's message: it joins the queue and wakes the planner, or is read right after the planner's current thought.
+        The script keeps running; the planner decides what to do about it."""
         self.inbox.append(text)
-        self._poke.set()
+        self.runner.wake("the player sent a message")
+
+    def queued(self) -> list[tuple[str, str]]:
+        """What waits for the planner to read: the player's messages, then what the script printed."""
+        mine = [("you", t.removeprefix("PLAYER: ")) for t in self.inbox if t.startswith("PLAYER")]
+        return mine + [("script", t) for t in self.runner.printed]
 
     def interrupt(self, reason: str) -> None:
         """End the turn now, stopping the script."""
@@ -122,6 +131,11 @@ class Brain:
         self._wake.clear()
         self._append("user", [{"type": "text", "text": prompt}, *self._news(full=False)])
         while True:
+            if self.ctx.game is not None and getattr(self.ctx.game.d, "human", False):
+                yield Step("planner", "paused")
+                await self._wait_for_player(r)
+                yield Step("planner", "resumed")
+                continue
             self._check_limits()
             if self._poke.is_set():
                 if not await self._poked():
@@ -167,6 +181,14 @@ class Brain:
                 elif call.name in ("remember", "forget"):  # memory changes at once, even while a script runs
                     outcome = self._memory(call.name, args)
                     yield Step("notes", outcome.text if outcome.ok else f"{call.name} refused: {outcome.text}", outcome.ok, {"key": args.get("key"), "value": args.get("value")})
+                elif call.name == "web":
+                    outcome = await self._web(args)
+                    yield Step("info", f"web: {args.get('question', '')} → {outcome.text}"[:400], outcome.ok)
+                elif call.name == "screenshot":
+                    content = await self._screenshot(args)
+                    yield Step("info", "the planner took a screenshot" if content[0]["type"] == "image" else content[0]["text"])
+                    results.append({"type": "tool_result", "tool_use_id": call.id, "content": content})
+                    continue
                 elif call.name in ("run", "wait"):
                     outcome = await self._control(call.name, args)
                     acted |= outcome.ok
@@ -211,6 +233,19 @@ class Brain:
         while not self._steps.empty():
             yield self._steps.get_nowait()
 
+    async def _wait_for_player(self, r: Runner) -> None:
+        """The player took control (F8): stop the script, make no model calls, and wait until it's given back."""
+        await r.interrupt("the player took control")
+        g = self.ctx.game
+        while g.d.human:
+            await asyncio.sleep(0.5)
+            try:
+                await g.read("state")  # every reply says who has control
+            except BridgeError:
+                pass
+        self._wake.clear()
+        self._append("user", [{"type": "text", "text": "PLAYER: I took control for a while and gave it back. Check what changed (time, place, energy, items) before going on."}])
+
     async def _poked(self) -> bool:
         """Handle a poke. Returns whether to go on: a player's message stops the script and goes on, a stop ends the turn."""
         self._poke.clear()
@@ -223,11 +258,11 @@ class Brain:
         """Handle run and wait."""
         if name == "wait":
             return Outcome("waiting" if not self.runner.idle else "nothing is running; the farmer keeps busy nearby")
-        source, goal, stop_if = args.get("script"), args.get("goal"), args.get("stop_if") or []
-        if not isinstance(source, str) or not isinstance(goal, str) or not isinstance(stop_if, list) or not all(isinstance(s, str) for s in stop_if):
-            return Outcome("run takes script (text), goal (text), stop_if (a list of situations), and finish_current", ok=False)
+        source, goal = args.get("script"), args.get("goal")
+        if not isinstance(source, str) or not isinstance(goal, str):
+            return Outcome("run takes script (text), goal (text), and finish_current", ok=False)
         try:
-            started = await self.runner.run(source, goal, stop_if, bool(args.get("finish_current")))
+            started = await self.runner.run(source, goal, bool(args.get("finish_current")))
         except Rejected as ex:
             return Outcome(f"run rejected, nothing changed: {ex}", ok=False)
         return Outcome(started)
@@ -263,10 +298,25 @@ class Brain:
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": i.data}} for i in images]
 
     async def _observe(self) -> list[dict]:
-        """A wake-up: the news, the status, and what is running."""
+        """A wake-up: the news, the farmer and a map of what's around, and what is running."""
         self._wake.clear()
         news = self._news()
-        return [*news, {"type": "text", "text": f"{await status(self.ctx.game)}\n{self.runner.describe()}"}]
+        return [*news, {"type": "text", "text": f"Farmer: {await status(self.ctx.game)}\n{await self._map()}{self.runner.describe()}"}]
+
+    async def _map(self) -> str:
+        """A text map of the farmer's surroundings, for every wake-up (the planner wakes rarely, so it's worth the tokens)."""
+        try:
+            return f"Around you:\n{(await look.tile_map(self.ctx.game, MAP_RADIUS))['map']}\n"
+        except Exception:  # between locations, or in a menu: the status says enough
+            return ""
+
+    async def _screenshot(self, args: dict) -> list[dict]:
+        radius, grid = args.get("radius"), bool(args.get("grid"))
+        try:
+            image = await sdk.screenshot(self.ctx, radius, grid)
+        except Exception as ex:
+            return [{"type": "text", "text": f"no screenshot: {ex}"}]
+        return [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image.data}}, {"type": "text", "text": "the screen now"}]
 
     async def summarize(self, prompt: str, max_tokens: int = 1500) -> str:
         """Summarize the conversation so far, with the summary model (the main model by default, whose cache makes it cheapest)."""
@@ -280,27 +330,27 @@ class Brain:
         self._count(response, 0)
         return "\n".join(b.text for b in response.content if b.type == "text").strip()
 
-    async def lookup(self, question: str) -> str:
-        """Answer a question from the web. This is a separate conversation, since searched pages would flood this one."""
+    async def _web(self, args: dict) -> Outcome:
+        """The web tool: a small research subagent answers, so searched pages never enter this context."""
+        question = args.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return Outcome("web takes a question", ok=False)
+        if not self.research:
+            return Outcome("web lookups are off (no TINYFISH_API_KEY, or --no-web)", ok=False)
         if self.lookups >= self.limits.lookups:
-            raise ActionError(f"no lookups left today (limit {self.limits.lookups})")
+            return Outcome(f"no lookups left today (limit {self.limits.lookups})", ok=False)
         self.lookups += 1
         self.usage.web += 1
-        prompt = f"Answer this question about the game Stardew Valley (version 1.6): {question}\n\nSearch, preferring stardewvalleywiki.com, and fetch the page if the search result isn't enough. Reply with only the facts which answer it, under 120 words. If you can't find it, say so."
         try:
-            response = await self.client.messages.create(model=self.model, max_tokens=3000, tools=SERVER_TOOLS, messages=[{"role": "user", "content": prompt}])
+            answer, _ = await self.research.answer(question)
         except anthropic.APIError as ex:
-            raise ActionError(f"the lookup failed: {ex.message[:200]}") from None
-        self._count(response, 0)
-        self.usage.turns -= 1
-        return "\n".join(b.text for b in response.content if b.type == "text").strip() or "nothing found"
+            return Outcome(f"the lookup failed: {ex.message[:200]}", ok=False)
+        return Outcome(answer)
 
     # --- internals -----------------------------------------------------------------------------------------
 
     def _append(self, role: str, content: list) -> None:
         self.messages = self._join(self.messages, role, content)
-        if role == "user" and self.on_context:  # every tool use has its result: a context which can be resumed
-            self.on_context(self.messages)
 
     @staticmethod
     def _join(messages: list[dict], role: str, content: list) -> list[dict]:

@@ -30,11 +30,9 @@ class Director:
         self.after_result: Callable[[], Awaitable[None]] | None = None  # e.g. to draw the map
         self.ended = False  # the day ended without sleep
         self.date: str | None = None
-        self.resumable = True  # the first day played may continue a day the last run didn't finish
         self._context_failed = False
         ctx.memory = kv.Memory(save.memory_file)
         ctx.before_action = self.wait_for_control  # the player may have taken control
-        brain.on_context = self.save_context
 
     def show(self, kind: str, text: str, data: dict | None = None, ok: bool = True) -> None:
         """Show a step and add it to the day's transcript."""
@@ -156,6 +154,8 @@ class Director:
         if not self.ended and not self.ctx.finished:
             await self.last_words()
         await self.consolidate(date, await self.write_diary(date))
+        self.ctx.memory.save()  # the memory and the context reach disk only now that the day is over, as the game's own save does
+        self.save_context(self.brain.messages)
         if self.ended:
             self.show("info", "the farmer passed out")
             await self.settle_choices(await self.game.finish_night(today))
@@ -164,19 +164,10 @@ class Director:
         self.show("info", f"usage: {self.brain.usage}")
 
     async def opening(self, date: str) -> str:
-        """The day's first prompt: the morning report, or, when the last run stopped partway through this same day, its saved context and a note to continue."""
-        saved = self.save.load_context(date) if self.resumable else None
-        self.resumable = False
-        if saved:
-            self.brain.messages = saved["messages"]
-            self.brain.usage.turns = int(saved.get("turns") or 0)
-            self.show("info", f"resuming today from the saved context ({len(saved['messages'])} messages)")
-            report = await self.report(resumed=True)
-            self.show("report", report)
-            return report
+        """The day's first prompt: the morning report. (A run stopped partway through a day starts it again, as the game does.)"""
         report = await self.report()
         self.show("report", report)
-        return f"{report}\n\nPlan the day, then play it."
+        return f"{report}\n\nPlan the first stretch of the day (an errand or a few hours), then run it."
 
     async def think(self, prompt: str, turns: int | None = None) -> None:
         """Let the model play, showing what it does; turns caps how many more model turns it gets."""
@@ -242,18 +233,12 @@ class Director:
                 else:
                     return  # the model will see it in the report
 
-    async def report(self, resumed: bool = False) -> str:
-        """What the model wakes up to; resumed: after the program restarted partway through the day."""
+    async def report(self) -> str:
+        """What the model wakes up to."""
         g = self.game
         overnight = news(g.drain_journal())
         state = await look.state(g)
         items = await look.items(g)
-        if resumed:
-            return "\n\n".join([
-                "The agent program was restarted partway through today. Your turns so far today are above; any script that was running "
-                "was stopped. Check where you are and continue the day.", self.memory.section(),
-                *(["# Since then\n" + overnight] if overnight else []),
-                "# Now\n" + render(state) + "\ninventory:\n" + render(items["items"], 1) + f"\n{await status(g)}"])
         parts = [f"GOAL: {self.goal}", self.memory.section()]
         if week := self.diary():
             parts.append("# The last days (automatic summaries)\n" + "\n".join(f"- {d['date']}: {d['summary']}" for d in week))
