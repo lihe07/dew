@@ -27,7 +27,7 @@ Commands (`just` lists them). The agent can play in two places:
 
 | | Your game | Sandbox |
 |---|---|---|
-| let the agent play | `just play ARGS` | `just sandbox play ARGS` |
+| let the agent play | `just play ARGS` | `just sandbox play ARGS` (add `--show` to watch it in a window, muted) |
 | list saves | `just saves` | `just sandbox saves` |
 | other | `just install` (put the mod in your game) | `just sandbox stop`, `just sandbox log` |
 
@@ -235,6 +235,6 @@ just test-live                    # plus the live tests, in the sandbox
 just sandbox stop
 ```
 
-A running sandbox keeps the mod it started with: after changing the mod, `just sandbox stop` and play again.
+A running sandbox keeps the mod it started with, and stays hidden or shown as it started: after changing the mod, or to switch, `just sandbox stop` and play again.
 
 Live tests are skipped unless `STARDEW_SESSION` points at a running game's `session.json`; `just test-live` sets it for the sandbox.

@@ -14,8 +14,9 @@ default:
 # --- your game ---------------------------------------------------------------
 
 # Let the agent play your running game, e.g. `just play --days 3`
+[positional-arguments]
 play *args:
-    cd agent && STARDEW_DATA="{{data}}" uv run stardew play {{args}}
+    cd agent && STARDEW_DATA="{{data}}" uv run stardew play "$@"
 
 # List the saves in your running game
 saves:
@@ -27,16 +28,22 @@ install:
 
 # --- sandbox -----------------------------------------------------------------
 
-# Sandbox: `just sandbox play [--save FOLDER ...]`, `just sandbox stop`, `just sandbox log`, `just sandbox saves`
+# Sandbox: `just sandbox play [--show] [--save FOLDER ...]` (--show: in a window, muted), `just sandbox saves|stop|log`
+[positional-arguments]
 sandbox command="play" *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    shift  # the command
+    rest=()
+    for a in "$@"; do
+      if [ "$a" = --show ]; then export SANDBOX_SHOW=1; else rest+=("$a"); fi
+    done
     case "{{command}}" in
-      play)  scripts/sandbox.sh ready; cd agent && STARDEW_SESSION={{sandbox_session}} STARDEW_DATA="{{data}}" uv run stardew play {{args}} ;;
+      play)  scripts/sandbox.sh ready; cd agent && STARDEW_SESSION={{sandbox_session}} STARDEW_DATA="{{data}}" uv run stardew play "${rest[@]}" ;;
       saves) scripts/sandbox.sh ready; cd agent && STARDEW_SESSION={{sandbox_session}} uv run stardew saves ;;
       start) scripts/sandbox.sh ready ;;
       stop)  scripts/sandbox.sh stop ;;
-      log)   scripts/sandbox.sh log {{args}} ;;
+      log)   scripts/sandbox.sh log "${rest[@]}" ;;
       *)     echo "just sandbox play|saves|start|stop|log" >&2; exit 2 ;;
     esac
 
