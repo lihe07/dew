@@ -71,6 +71,10 @@ class TUI:
         self.action_since = 0.0
         self.paused = False  # the player has control (F8)
         self._woke: list[str] = []  # why the planner was woken, for its next turn's heading
+        self.researching: tuple[str, float] | None = None  # the web question under way, and since when
+        self.usage: Callable[[], Any] = lambda: None  # the planner's usage, for the header
+        self.model = ""
+        self.help = False
 
     # --- the same interface as Display -----------------------------------------------------------------------
 
@@ -91,6 +95,7 @@ class TUI:
                 day.lines.append(Text("◆ Planner", "bold magenta") + Text(f" · woke: {woke}", "grey62") + Text(f" · {at}" if at else "", "grey42"))
                 self._woke = []
             self.thinking_since = time.monotonic() if text == "thinking" else None
+            self.researching = (data.get("question", ""), time.monotonic()) if text == "researching" else None
             self.paused = text == "paused"
             if text in ("paused", "resumed"):
                 day.lines.append(Text("⏸ you took control; the agent is paused" if text == "paused" else "▶ control given back; the agent goes on", "bold cyan"))
@@ -126,6 +131,11 @@ class TUI:
             day.lines.append(Text("✻ ", "grey50") + Text(shorten(text, 2), "grey58 italic"))
         elif kind == "say":
             day.lines.append(Text("● ", "bright_white") + Text(shorten(text, 3), "bright_white"))
+        elif kind == "docs":
+            day.lines.append(Text("◇ " + text, "blue"))
+        elif kind == "web":
+            day.lines.append(Text("◇ Web · ", "bold blue") + Text(data.get("question", ""), "blue"))
+            day.lines.append(Text(shorten(text, 4), "grey70" if ok else "red"))
         elif kind == "notes":
             if text.startswith("diary"):
                 day.diary = text.split(":", 1)[-1].strip()
@@ -206,8 +216,11 @@ class TUI:
         queue = self._queue() if live else []
         root.split_column(Layout(self._header(index), size=1), Layout(name="body"), Layout(Group(*queue), size=max(1, len(queue)), visible=bool(queue)),
                           Layout(self._activity(day, live), size=1), Layout(self._input(live), size=3), Layout(self._hint(), size=1))
+        if self.help:
+            root["body"].update(self._help())
+            return root
         root["body"].split_row(Layout(self._timeline(day), name="timeline", ratio=3), Layout(name="side", ratio=2, minimum_size=40))
-        root["side"].split_column(Layout(self._plan(day), name="plan"), Layout(self._farmer(day, live), size=9))
+        root["side"].split_column(Layout(self._plan(day), name="plan"), Layout(self._farmer(day, live), size=11))
         return root
 
     def _panel(self, body: Any, title: str, name: str | None = None, subtitle: str | None = None) -> Panel:
@@ -224,8 +237,17 @@ class TUI:
         grid = Table.grid(expand=True)
         grid.add_column(no_wrap=True)
         grid.add_column(justify="right", no_wrap=True)
-        grid.add_row(Text(" dew ", "bold bright_white") + tabs, Text("←/→ days ", "grey42"))
+        grid.add_row(Text(" dew ", "bold bright_white") + tabs, self._cost())
         return grid
+
+    def _cost(self) -> Text:
+        """What the planner has used today: turns, tokens (and how much was cached), web lookups."""
+        u = self.usage()
+        if u is None:
+            return Text("? help ", "grey42")
+        tokens = u.input + u.cached
+        hit = u.cached / max(1, tokens)
+        return Text(f"{self.model} · {u.turns} turns · {tokens / 1000:.0f}k tok ({hit:.0%} cached)" + (f" · {u.web} web" if u.web else "") + " · ? help ", "grey50")
 
     def _timeline(self, day: Day) -> Panel:
         view = Rows(day.lines, self.scroll, lambda top: setattr(self, "_timeline_max", top))
@@ -240,6 +262,18 @@ class TUI:
         body = Code(script["goal"], script["source"], at, self.plan_top, self._plan_seen)
         return self._panel(body, "Plan", "plan", where)
 
+    def _help(self) -> Panel:
+        keys = Table.grid(padding=(0, 3))
+        keys.add_column(style="bold bright_white", no_wrap=True)
+        keys.add_column(style="grey70")
+        for key, does in (("type, Enter", "queue a message for the planner (it wakes, or reads it after its current thought)"),
+                          ("Tab", "switch the pane the keys scroll: Timeline or Plan"), ("↑ ↓, PgUp PgDn, wheel", "scroll it"),
+                          ("Home / End", "the start / follow the newest again"), ("← →", "earlier and later days"),
+                          ("F8, in the game", "take control (the agent pauses); F8 again gives it back"), ("q", "quit, once the agent is done"),
+                          ("?", "this help")):
+            keys.add_row(key, does)
+        return self._panel(keys, "Keys")
+
     def _plan_seen(self, first: int, last_top: int) -> None:
         self._plan_shown, self._plan_max = first, last_top
 
@@ -253,8 +287,14 @@ class TUI:
         grid.add_column(style="grey50", no_wrap=True)
         grid.add_column(ratio=1)
         grid.add_column(justify="right", no_wrap=True)
-        when = " · ".join(str(v) for v in (s.get("date"), s.get("text") or clock(s.get("clock")), s.get("weather")) if v)
+        when = " · ".join(str(v) for v in (s.get("text") or clock(s.get("clock")), s.get("weather")) if v)  # the date is in the day's tab
         grid.add_row("when", Text(when), "")
+        if isinstance(s.get("clock"), int):
+            gone = max(0, min(1200, minutes_since_6am(s["clock"])))
+            late = s["clock"] >= 1800
+            left = 1200 - gone
+            grid.add_row("day", ProgressBar(total=1200, completed=gone, complete_style="bright_red" if left < 120 else "magenta" if late else "blue", finished_style="red", style="grey23"),
+                         Text(f"{left // 60}h{left % 60:02d} left" if late else "", "bright_red" if left < 120 else "grey62"))
         grid.add_row("where", Text(str(s.get("place", "")), "bold"), "")
         for label, value, top, style in (("energy", s.get("energy"), s.get("maxe"), "yellow"), ("health", s.get("hp"), s.get("maxh"), "red")):
             value, top = int(value or 0), int(top or 1)
@@ -283,6 +323,9 @@ class TUI:
         line = Text(" ")
         if self.paused:
             return line.append("⏸ Paused", "bold cyan").append(" · you have control in the game · F8 gives it back", "grey50")
+        if self.researching:
+            question, since = self.researching
+            return line.append(f"{spin} Researching", "bold blue").append(f" · “{question[:80]}” · {elapsed(since)}", "grey50")
         if self.thinking_since is not None:
             line.append(f"{spin} Planner thinking", "bold magenta").append(f" · {elapsed(self.thinking_since)}", "grey50")
             if self.script_live:
@@ -310,7 +353,7 @@ class TUI:
     def _hint(self) -> Text:
         if self.notice:
             return Text("  " + self.notice, "green")
-        return Text("  Enter queues a message for the planner · Tab switches pane · ↑↓ PgUp PgDn wheel scroll · End follows"
+        return Text("  Enter sends to the planner · Tab pane · ↑↓ scroll · ←→ days · ? help"
                     + (f" · {self.header}" if self.header else ""), "grey42")
 
     # --- keys ------------------------------------------------------------------------------------------------
@@ -349,6 +392,10 @@ class TUI:
             self._scroll(10**6)
         elif key in ("\x1b[F", "\x1b[4~"):  # End: follow the newest again
             self._scroll(-10**6)
+        elif key == "?" and not self.typed:
+            self.help = not self.help
+        elif self.help and key == "\x1b":
+            self.help = False
         elif key == "\t":
             self.focus = "plan" if self.focus == "timeline" else "timeline"
         elif key.startswith("\x1b"):
@@ -432,6 +479,11 @@ def nest(line: Text) -> Text:
     """A line under the script above it: flush left, like everything else."""
     indent = len(line.plain) - len(line.plain.lstrip())
     return line.divide([indent])[-1] if indent else line
+
+
+def minutes_since_6am(clock: int) -> int:
+    h, m = divmod(clock, 100)
+    return (h - 6) * 60 + m
 
 
 def elapsed(since: float) -> str:

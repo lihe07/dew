@@ -60,7 +60,7 @@ class Menus:
         if kind == "ItemGrabMenu" and menu["source"] == 4 and not discard:
             left = [s for grid in await self.read("menu.inventories") if not grid["player"] for s in grid["slots"] if s.get("item")]
             if left:
-                raise ActionError("closing this would destroy the items in it; take them (use_item action='trash' can make room), or pass discard_items")
+                raise ActionError("closing this would destroy the items in it; take them first (trash(item) can make room)")
         if await self.read("menu.held") and kind != "InventoryPage":
             await self.stow_held()
         await self.step(180, "menu == null or menu.closable")

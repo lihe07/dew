@@ -88,7 +88,8 @@ def spots(area: Any = None, tiles: Any = None) -> list[tuple[int, int]]:
 
 def recovers(name: str, args: dict) -> bool:
     """Actions which cure low health, low energy, or the late hour, so safety lets them run."""
-    return name in ("sleep", "eat") or name == "go" and isinstance(args.get("target"), str) and args["target"] in HOMES
+    home = isinstance(args.get("target"), str) and args["target"].strip().lower().replace(" ", "") in {"farm", "farmhouse", "home", "house", "bed"}
+    return name in ("sleep", "eat", "soak") or name == "go" and home
 
 
 def named(item: Any) -> str:

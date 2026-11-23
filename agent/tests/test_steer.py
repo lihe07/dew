@@ -45,4 +45,4 @@ def test_later_waits_for_the_next_wake_up(make_brain, acts):
     asyncio.run(go())
     assert names(acts) == ["mine"]  # not stopped
     assert not ctx.game.released
-    assert "PLAYER: buy seeds later" in last_text(sent[1]) and "#1 mine:\ndone" in last_text(sent[1])
+    assert "PLAYER: buy seeds later" in last_text(sent[1]) and "09:00 mine" in last_text(sent[1])

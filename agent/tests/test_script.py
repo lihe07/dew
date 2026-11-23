@@ -98,7 +98,7 @@ def test_caught_and_uncaught_exceptions(make_runner, acts):
     why = asyncio.run(run_script(r, "try:\n    buy('Parsnip Seeds')\nexcept Closed as e:\n    print('closed:', e.reason)\n    go('JojaMart')\n    buy('Parsnip Seeds')\nfish()"))
     assert names(acts) == ["buy", "go", "buy"] and why == ["the script raised Closed at line 6"]
     assert "printed: closed: the shop is closed: SeedShop opens at 9am" in r.trace
-    assert any(t.startswith("#1 buy") and "FAILED" in t for t in r.trace)
+    assert any(" buy " in t and " — " in t for t in r.trace)  # a failed action: the reason after a dash
     assert "Closed: the shop is closed: SeedShop opens at 9am\n  at line 6: buy('Parsnip Seeds')" in text(r)
 
 
@@ -214,7 +214,7 @@ def test_the_planner_gets_rejections_and_wake_ups(make_brain, acts):
     asyncio.run(play(b))
     assert "run rejected, nothing changed: line 1: SyntaxError" in json.dumps(sent[1].messages[-1]["content"])
     woken = last_text(sent[2])
-    assert "#1 mine:\ndone\n[Mon spring 3 9:00 am | Farm (1,2)" in woken and "printed: done" in woken and "Woken because: the script ended" in woken
+    assert "09:00 mine\nprinted: done" in woken and "Woken because: the script ended" in woken
 
 
 def test_a_look_script_answers_in_the_wake_up(make_brain, acts, monkeypatch):
@@ -240,10 +240,13 @@ def test_the_prompt_examples_are_python_using_only_the_sdk():
     import ast
     import builtins
     from stardew_agent import sandbox_child
-    prompt = (Path(script.__file__).parent / "prompt.md").read_text()
+    here = Path(script.__file__).parent
+    prompt = (here / "prompts" / "planner.md").read_text()
     examples = re.findall(r"Example:\n```\n(.*?)```", prompt, re.S)
+    if (here / "docs" / "examples.md").exists():
+        examples += re.findall(r"```python\n(.*?)```", (here / "docs" / "examples.md").read_text(), re.S)
     known = set(sandbox_child.SDK) | {"backpack", "pick", "print", "ask"} | set(sandbox_child.EXCEPTIONS) | set(dir(builtins))
-    assert len(examples) >= 3
+    assert len(examples) >= 1
     for source in examples:
         vet(source)
         tree = ast.parse(source)

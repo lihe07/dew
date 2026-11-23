@@ -58,6 +58,13 @@ class Display:
     def _wake(self, kind, text, data, ok):
         self.console.print(Text("⏸ woken: " + text, "grey62"))
 
+    def _docs(self, kind, text, data, ok):
+        self.console.print(Text("◇ " + text, "blue"))
+
+    def _web(self, kind, text, data, ok):
+        self.console.print(Text("◇ Web · ", "bold blue") + Text(data.get("question", ""), "blue"))
+        self.console.print(Text(text if self.verbose else text[:500], "grey70" if ok else "red"))
+
     def _think(self, kind, text, data, ok):
         lines = [l for l in text.split("\n") if l.strip()]
         short = " ".join(lines if self.verbose else lines[:2])
@@ -148,15 +155,16 @@ def notes_text(text: str, data: dict, verbose: bool = False) -> str:
     return text if verbose else text[:400]
 
 
-def action_lines(data: dict, ok: bool) -> list[Text]:
-    """A finished action: one line, plus anything said or shown meanwhile."""
+def action_lines(data: dict, ok: bool, full: bool = False) -> list[Text]:
+    """A finished action: one line, plus anything said or shown meanwhile. The one way an action is told: the view draws these,
+    and the planner reads their plain text (full: nothing cut short)."""
     s, value, entries = data.get("status") or {}, data.get("value"), data.get("journal") or []
     line = Text(f"{clock(s.get('clock'))} ", "grey50")
     line.append(call_text(data["name"], data.get("args") or {}), "bold bright_white" if ok else "bold red")
-    if ok and (summary := summarize(value)):
+    if ok and (summary := summarize(value, full)):
         line.append(f"  {summary}", "default")
     if not ok:  # red, with why: no mark needed
-        line.append(f" — {(data.get('error') or 'failed')[:160]}", "red")
+        line.append(f" — {(data.get('error') or 'failed')[:None if full else 160]}", "red")
     places = [e["text"].removeprefix("entered ") for e in entries if e["kind"] == "place"]
     if len(places) > 1:
         line.append("  via " + " → ".join(places[:-1]), "grey50")
@@ -165,7 +173,7 @@ def action_lines(data: dict, ok: bool) -> list[Text]:
     lines = [line]
     for e in entries:
         if e["kind"] in ("dialogue", "letter", "question", "level", "message", "quest", "chat", "event"):
-            lines.append(Text(f"  {e['kind']}: {e['text'][:200]}", "grey62" if e["kind"] in ("dialogue", "chat") else "grey50"))
+            lines.append(Text(f"  {e['kind']}: {e['text'][:None if full else 200]}", "grey62" if e["kind"] in ("dialogue", "chat") else "grey50"))
     return lines
 
 
@@ -205,13 +213,15 @@ def area_text(value: list) -> str:
     return f"{len(value)} tiles"
 
 
-def summarize(value: Any) -> str:
+def summarize(value: Any, full: bool = False) -> str:
+    """An action's result in a few words; full (for the planner) keeps every field, uncut."""
+    limit = None if full else 120
     if isinstance(value, dict):
-        parts = [f"{k} {v}" for k, v in value.items() if k not in QUIET_KEYS and k != "items" and v not in (None, [], {}, "")]
-        return ", ".join(parts)[:120]
+        parts = [f"{k} {v}" for k, v in value.items() if (full or k not in QUIET_KEYS) and k != "items" and v not in (None, [], {}, "")]
+        return ", ".join(parts)[:limit]
     if isinstance(value, list):
-        return f"{len(value)} found" if value else "none"
-    return "" if value in (None, "done", True) else str(value)[:120]
+        return (", ".join(map(str, value)) if full else f"{len(value)} found") if value else "none"
+    return "" if value in (None, "done", True) else str(value)[:limit]
 
 
 def items(entries: list[dict]) -> dict[str, int]:

@@ -14,7 +14,7 @@ from .decide import GATEWAY
 from .web import Research
 from .driver import BridgeError
 from .game import ActionError
-from . import look, sdk
+from . import docs, look, sdk
 from .look import news, status
 from .memory import MAX_KEY, MAX_VALUE
 from .script import Context, Outcome, Rejected, Runner, Step
@@ -35,8 +35,12 @@ SCREENSHOT = {"name": "screenshot", "description": "See the game screen now, wit
                   "grid": {"type": "boolean", "description": "Overlay tile coordinates"}}}}
 WEB = {"name": "web", "description": "Ask a research helper a question about the game; it searches the web and reads the wiki, then answers in a few sentences. It takes a few seconds and costs a little, so remember what you learn.",
        "input_schema": {"type": "object", "additionalProperties": False, "required": ["question"], "properties": {"question": {"type": "string", "maxLength": 400}}}}
+DOCS = {"name": "docs", "description": "Read a documentation topic by its path (like farming, or farming/crops from a link in another doc), or one section of it as path#section.",
+        "input_schema": {"type": "object", "additionalProperties": False, "required": ["topic"], "properties": {"topic": {"type": "string", "maxLength": 100}}}}
+SEARCH_DOCS = {"name": "search_docs", "description": "Search all the documentation for a word or regular expression; returns matching lines as topic#section: line.",
+               "input_schema": {"type": "object", "additionalProperties": False, "required": ["pattern"], "properties": {"pattern": {"type": "string", "maxLength": 200}}}}
 WAIT = {"name": "wait", "description": "Let the script run and end your turn. You're woken when it ends or needs you.", "input_schema": {"type": "object", "properties": {}}}
-TOOLS = [REMEMBER, FORGET, RUN, SCREENSHOT, WEB, WAIT]
+TOOLS = [REMEMBER, FORGET, RUN, SCREENSHOT, WEB, DOCS, SEARCH_DOCS, WAIT]
 MAP_RADIUS = 10  # tiles each way in the map at every wake-up
 
 
@@ -181,9 +185,15 @@ class Brain:
                 elif call.name in ("remember", "forget"):  # memory changes at once, even while a script runs
                     outcome = self._memory(call.name, args)
                     yield Step("notes", outcome.text if outcome.ok else f"{call.name} refused: {outcome.text}", outcome.ok, {"key": args.get("key"), "value": args.get("value")})
+                elif call.name in ("docs", "search_docs"):  # answered at once, from files
+                    value = args.get("topic" if call.name == "docs" else "pattern")
+                    outcome = Outcome(docs.read(value) if call.name == "docs" else docs.grep(value)) if isinstance(value, str) and value.strip() else Outcome(f"{call.name} takes {'a topic' if call.name == 'docs' else 'a pattern'}", ok=False)
+                    yield Step("docs", f"{call.name} {value}", outcome.ok)
                 elif call.name == "web":
+                    yield Step("planner", "researching", data={"question": str(args.get("question", ""))})
                     outcome = await self._web(args)
-                    yield Step("info", f"web: {args.get('question', '')} → {outcome.text}"[:400], outcome.ok)
+                    yield Step("planner", "done")
+                    yield Step("web", outcome.text, outcome.ok, {"question": str(args.get("question", ""))})
                 elif call.name == "screenshot":
                     content = await self._screenshot(args)
                     yield Step("info", "the planner took a screenshot" if content[0]["type"] == "image" else content[0]["text"])
@@ -301,14 +311,27 @@ class Brain:
         """A wake-up: the news, the farmer and a map of what's around, and what is running."""
         self._wake.clear()
         news = self._news()
-        return [*news, {"type": "text", "text": f"Farmer: {await status(self.ctx.game)}\n{await self._map()}{self.runner.describe()}"}]
+        return [*news, {"type": "text", "text": f"Farmer: {await status(self.ctx.game)}\n{await self._backpack()}{await self._map()}{self.runner.describe()}"}]
+
+    async def _backpack(self) -> str:
+        try:
+            items = await self.ctx.game.inventory()
+            free = await self.ctx.game.read("player.free_slots")
+        except Exception:
+            return ""
+        def one(i: dict) -> str:
+            extra = f" (water {i['water']}/{i['water_max']})" if i.get("water") is not None else f" x{i['stack']}" if (i.get("stack") or 1) > 1 else ""
+            return f"{i['name']}{extra}"
+        return f"Backpack ({free} free): {', '.join(one(i) for i in items)}\n"
 
     async def _map(self) -> str:
-        """A text map of the farmer's surroundings, for every wake-up (the planner wakes rarely, so it's worth the tokens)."""
+        """A text map of the farmer's surroundings, and the named things on it, for every wake-up (the planner wakes rarely, so it's worth the tokens)."""
         try:
-            return f"Around you:\n{(await look.tile_map(self.ctx.game, MAP_RADIUS))['map']}\n"
+            m = await look.tile_map(self.ctx.game, MAP_RADIUS)
         except Exception:  # between locations, or in a menu: the status says enough
             return ""
+        nearby = "; ".join(m.get("notable", [])[:15])
+        return f"Map of {m['location']} around you:\n{m['map']}\n" + (f"Nearby: {nearby}\n" if nearby else "")
 
     async def _screenshot(self, args: dict) -> list[dict]:
         radius, grid = args.get("radius"), bool(args.get("grid"))

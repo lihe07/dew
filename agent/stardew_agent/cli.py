@@ -27,7 +27,7 @@ from .script import Context
 from .storage import SaveData, data_root
 
 ROOT = Path(__file__).resolve().parents[2]
-PROMPT = (Path(__file__).parent / "prompt.md").read_text()
+PROMPT = (Path(__file__).parent / "prompts" / "planner.md").read_text()
 
 console = Console(highlight=False)
 MAP_STYLES = {"@": "bold black on yellow", "~": "blue", "T": "green", "t": "green", '"': "green", "B": "green", "w": "green4", "c": "yellow", "v": "bright_green", "R": "bold bright_green",
@@ -159,7 +159,7 @@ async def play_in_panels(args: argparse.Namespace, game: Game, brain: Brain, ctx
     """The full-screen view, with a tab per day; the save's last 7 days are loaded, so they can be looked through."""
     console.print(f"[grey50]{args.model} · {save.folder} · F8 in the game takes control[/]")
     tui = TUI(console, header="F8 takes control")
-    tui.on_steer, tui.queued = brain.steer, brain.queued
+    tui.on_steer, tui.queued, tui.usage, tui.model = brain.steer, brain.queued, lambda: brain.usage, args.model
     tui.load(save.load_days(7))
     director = Director(game, brain, ctx, goal=args.goal, save=save, show=tui.show, memory_model=memory_model, verbose=args.verbose)
     for line in said:

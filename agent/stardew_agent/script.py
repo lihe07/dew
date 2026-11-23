@@ -20,6 +20,7 @@ from . import wasm_host
 from .driver import BridgeError, Disconnected, HumanControl
 from .game import ActionError, Game, Interrupted
 from .memory import Memory
+from .display import action_lines
 from .look import Image, minutes, news, render, status, until_2am
 from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
 from .sdk import ACTIONS, FACTS, recovers
@@ -105,8 +106,8 @@ def vet(source: str) -> None:
 
 FAILURES = [
     (Closed, r"\bclosed\b|\blocked\b|festival|isn't around today|didn't open|no shop is open"),
-    (NotEnough, r"inventory is (too )?full|free inventory slot|but you have \d+g|you don't have|missing ingredients|out of energy|isn't in there|is empty|only \d+ of|is there room|no tilled, empty soil"),
-    (Unreachable, r"couldn't reach|no walking route|couldn't get to|lost sight|couldn't catch up|gave up travelling|blocked"),
+    (NotEnough, r"inventory is (too )?full|free inventory slot|but you have \d+g|you don't have|missing ingredients|out of energy|isn't in there|isn't in your backpack|isn't in the chest|is empty|only \d+ of|is there room|no tilled, empty soil"),
+    (Unreachable, r"couldn't reach|no walking route|couldn't get to|lost sight|couldn't catch up|gave up travelling|blocked|can't reach|can't get beside|no walkable path"),
 ]
 
 
@@ -122,7 +123,13 @@ def failure(reason: str) -> ActionFailed:
 def interruption(what: str, choices: list[str] | None) -> Surprise:
     """The exception for something which needs a decision before the action can go on."""
     what = what.split("\n")[0]
-    return Cutscene(what) if "cutscene" in what or "minigame" in what else Question(what, choices or [])
+    if "cutscene" in what or "minigame" in what:
+        return Cutscene(what)
+    if not choices and re.search(r"\benergy is\b", what):  # a skill's own stop (mine, fight, walking), not a question
+        return LowEnergy(what)
+    if not choices and re.search(r"\bhealth is\b|\bretreating\b|\blow health\b", what):
+        return LowHealth(what)
+    return Question(what, choices or [])
 
 
 # --- facts and the judge -----------------------------------------------------------------------------------
@@ -699,9 +706,12 @@ class Runner:
         return True
 
     def _record(self, job: Job, outcome: Outcome) -> None:
-        self._last = (job.label, outcome.text)
-        self._trace.append(f"{job.label}{'' if outcome.ok else ' FAILED'}:\n{outcome.text}")
-        self.emit(Step("result", f"{job}: {outcome.text}", outcome.ok, {"name": job.name, "args": job.args, **outcome.shown} if outcome.shown else {}))
+        data = {"name": job.name, "args": job.args, **outcome.shown} if outcome.shown else {}
+        # the planner reads the same lines the view draws (display.action_lines), as plain text and uncut
+        told = "\n".join(line.plain for line in action_lines(data, outcome.ok, full=True)) if data else f"{job.label}: {outcome.text}"
+        self._last = (job.label, told)
+        self._trace.append(told)
+        self.emit(Step("result", f"{job}: {outcome.text}", outcome.ok, data))
 
     async def _stock(self, script: Script) -> list[dict]:
         async with self._lock:

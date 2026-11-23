@@ -9,8 +9,8 @@ from stardew_agent.look import news, render
 from stardew_agent.script import Context
 
 
-def test_the_planner_sees_six_described_tools():
-    assert [t["name"] for t in planner.TOOLS] == ["remember", "forget", "run", "screenshot", "web", "wait"]
+def test_the_planner_sees_described_tools():
+    assert [t["name"] for t in planner.TOOLS] == ["remember", "forget", "run", "screenshot", "web", "docs", "search_docs", "wait"]
     for t in planner.TOOLS:
         assert t["description"] and t["input_schema"]["type"] == "object"
 

@@ -1,0 +1,1 @@
+The day is over. In under 120 words, summarize it for your future self: what you did and earned, what you learned (prices, places, people, what worked or failed), and what's unfinished. Plain text, no headings.

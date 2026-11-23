@@ -71,7 +71,7 @@ class Trade:
             # e.g. the blacksmith asks whether to shop, upgrade, or open geodes
             pick = next((i for i, c in enumerate(choices) if any(k in c.lower() for k in ("shop", "supplies", "buy"))), None)
             if pick is None:
-                raise Interrupted(f"the counter asks: {' / '.join(f'{i}: {c}' for i, c in enumerate(choices))}; answer with dialogue")
+                raise Interrupted(f"the counter asks: {' / '.join(f'{i}: {c}' for i, c in enumerate(choices))}; answer with answer(n)")
             await self.dialogue(pick)
             await self.step(30, "state.menu")
         if await self.read("menu.type") != "ShopMenu":
@@ -197,7 +197,7 @@ class Trade:
                 await self.stow_held()
             now = next((g for g in await self.read("menu.inventories") or [] if g["player"] == (action == "put")), None)
             if now and len([s for s in now["slots"] if s.get("item")]) >= len(full):
-                raise ActionError("that didn't move; is there room? (use_item action='trash' can make some)")
+                raise ActionError("that didn't move; is there room? (trash(item) can make some)")
             moved.append(label(slot["item"]))
             if text != "all":
                 break
