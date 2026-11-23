@@ -1,0 +1,12 @@
+.tools/
+bin/
+obj/
+__pycache__/
+.venv/
+dist/
+.env
+recordings/
+stardew-data/
+.pytest_cache/
+.ruff_cache/
+*.pyc

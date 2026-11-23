@@ -1,0 +1,123 @@
+[
+ {
+  "outcome": "can't hurt the Bug (killed 1)",
+  "result": {},
+  "health_lost": 50,
+  "max_health": 105,
+  "energy_used": 15,
+  "game_minutes": 90,
+  "real_seconds": 4.4,
+  "ended_on": 25,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ },
+ {
+  "outcome": "retreating: health is 23/105 and there's no food (killed 1)",
+  "result": {},
+  "health_lost": 82,
+  "max_health": 105,
+  "energy_used": 132,
+  "game_minutes": 200,
+  "real_seconds": 10.9,
+  "ended_on": 29,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": [
+   "tactics chose fight (0.96)",
+   "tactics chose fight (0.97)",
+   "tactics chose fight (0.96)"
+  ]
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 72,
+   "killed": 0
+  },
+  "health_lost": 34,
+  "max_health": 105,
+  "energy_used": 141,
+  "game_minutes": 160,
+  "real_seconds": 7.6,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 1
+   }
+  ],
+  "tactics": []
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 50,
+   "killed": 1
+  },
+  "health_lost": 26,
+  "max_health": 105,
+  "energy_used": 112,
+  "game_minutes": 130,
+  "real_seconds": 6.7,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 2
+   }
+  ],
+  "tactics": [
+   "tactics chose fight (0.87)"
+  ]
+ },
+ {
+  "outcome": "energy is 29; {'level': 29, 'descended': 4, 'rocks': 101, 'killed': 0}",
+  "result": {},
+  "health_lost": 0,
+  "max_health": 105,
+  "energy_used": 218,
+  "game_minutes": 190,
+  "real_seconds": 9.3,
+  "ended_on": 29,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 1
+   }
+  ],
+  "tactics": [
+   "tactics chose fight (0.96)",
+   "tactics chose fight (0.97)"
+  ]
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 62,
+   "killed": 5,
+   "ate": [
+    "Joja Cola",
+    "Joja Cola"
+   ]
+  },
+  "health_lost": 67,
+  "max_health": 105,
+  "energy_used": 118,
+  "game_minutes": 210,
+  "real_seconds": 10.0,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ }
+]

@@ -1,0 +1,24 @@
+[
+ {
+  "outcome": "done",
+  "result": {
+   "level": 28,
+   "descended": 3,
+   "rocks": 30,
+   "killed": 2
+  },
+  "health_lost": 5,
+  "max_health": 105,
+  "energy_used": 63,
+  "game_minutes": 60,
+  "real_seconds": 3.0,
+  "ended_on": 28,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 1
+   }
+  ]
+ }
+]

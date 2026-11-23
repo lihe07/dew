@@ -1,0 +1,10 @@
+{
+  "Name": "Stardew Bridge",
+  "Author": "lihe07",
+  "Version": "1.0.0",
+  "Description": "Low-level bridge (clock, input, read, frame, path) which lets a local agent play the game.",
+  "UniqueID": "lihe07.StardewBridge",
+  "EntryDll": "StardewBridge.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

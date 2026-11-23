@@ -1,0 +1,104 @@
+[
+ {
+  "outcome": "retreating: health is 49 (killed 1)",
+  "result": {},
+  "health_lost": 56,
+  "max_health": 105,
+  "energy_used": 78,
+  "game_minutes": 110,
+  "real_seconds": 5.2,
+  "ended_on": 28,
+  "passed_out": false,
+  "food_left": []
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 60,
+   "killed": 7
+  },
+  "health_lost": 16,
+  "max_health": 105,
+  "energy_used": 119,
+  "game_minutes": 140,
+  "real_seconds": 6.6,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 2
+   }
+  ]
+ },
+ {
+  "outcome": "can't hurt the Rock Crab; move away or leave this floor (killed 0)",
+  "result": {},
+  "health_lost": 12,
+  "max_health": 105,
+  "energy_used": 41,
+  "game_minutes": 30,
+  "real_seconds": 1.4,
+  "ended_on": 25,
+  "passed_out": false,
+  "food_left": []
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 50,
+   "killed": 1
+  },
+  "health_lost": 0,
+  "max_health": 105,
+  "energy_used": 100,
+  "game_minutes": 90,
+  "real_seconds": 4.2,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 2
+   }
+  ]
+ },
+ {
+  "outcome": "retreating: health is 52 (killed 0)",
+  "result": {},
+  "health_lost": 53,
+  "max_health": 105,
+  "energy_used": 61,
+  "game_minutes": 120,
+  "real_seconds": 5.5,
+  "ended_on": 29,
+  "passed_out": false,
+  "food_left": []
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 58,
+   "killed": 2
+  },
+  "health_lost": 0,
+  "max_health": 105,
+  "energy_used": 110,
+  "game_minutes": 100,
+  "real_seconds": 4.5,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 2
+   }
+  ]
+ }
+]

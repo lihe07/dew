@@ -1,0 +1,48 @@
+[
+ {
+  "outcome": "retreating: health is 52 (killed 0)",
+  "result": {},
+  "health_lost": 53,
+  "max_health": 105,
+  "energy_used": 5,
+  "game_minutes": 50,
+  "real_seconds": 2.5,
+  "ended_on": 25,
+  "passed_out": false,
+  "food_left": [
+   {
+    "name": "Joja Cola",
+    "stack": 1
+   }
+  ]
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 30,
+   "descended": 5,
+   "rocks": 37,
+   "killed": 0
+  },
+  "health_lost": 0,
+  "max_health": 105,
+  "energy_used": 76,
+  "game_minutes": 60,
+  "real_seconds": 3.3,
+  "ended_on": 30,
+  "passed_out": false,
+  "food_left": []
+ },
+ {
+  "outcome": "energy is 29; {'level': 29, 'descended': 4, 'rocks': 107, 'killed': 5}",
+  "result": {},
+  "health_lost": 31,
+  "max_health": 105,
+  "energy_used": 218,
+  "game_minutes": 190,
+  "real_seconds": 9.1,
+  "ended_on": 29,
+  "passed_out": false,
+  "food_left": []
+ }
+]

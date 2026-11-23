@@ -1,0 +1,62 @@
+[
+ {
+  "outcome": "retreating: health is 22/105 and there's no food (killed 0)",
+  "result": {},
+  "health_lost": 83,
+  "max_health": 105,
+  "energy_used": 203,
+  "game_minutes": 280,
+  "real_seconds": 13.1,
+  "ended_on": 34,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ },
+ {
+  "outcome": "done",
+  "result": {
+   "level": 35,
+   "descended": 5,
+   "rocks": 73,
+   "killed": 0,
+   "ate": [
+    "Green Algae"
+   ]
+  },
+  "health_lost": 64,
+  "max_health": 105,
+  "energy_used": 140,
+  "game_minutes": 280,
+  "real_seconds": 13.1,
+  "ended_on": 35,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ },
+ {
+  "outcome": "retreating: health is 26/105 and there's no food (killed 0)",
+  "result": {},
+  "health_lost": 79,
+  "max_health": 105,
+  "energy_used": 26,
+  "game_minutes": 110,
+  "real_seconds": 5.2,
+  "ended_on": 31,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ },
+ {
+  "outcome": "retreating: health is 24/105 and there's no food (killed 0)",
+  "result": {},
+  "health_lost": 81,
+  "max_health": 105,
+  "energy_used": 72,
+  "game_minutes": 200,
+  "real_seconds": 9.6,
+  "ended_on": 34,
+  "passed_out": false,
+  "food_left": [],
+  "tactics": []
+ }
+]
