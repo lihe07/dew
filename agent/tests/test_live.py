@@ -4,7 +4,10 @@ import asyncio
 import os
 
 import pytest
-from stardew_agent import sdk
+from stardew_agent.api.places import Here
+from stardew_agent.api.screen import Screen
+from stardew_agent.api.where import Area
+from stardew_agent.api.world import World
 from stardew_agent.driver import Driver, find_session
 from stardew_agent.game import Game
 from stardew_agent.script import Context
@@ -22,17 +25,18 @@ async def first_morning() -> dict:
     try:
         if not await game.read("state.world"):
             await game.new_game("Tester", "Smoke", "tests")
-        await sdk.screen(ctx, "interact", tiles=[[3, 7]])  # the gift box with the starting seeds
-        await sdk.go(ctx, "Farm")
-        await sdk.clear(ctx, [60, 17, 66, 21])
-        await sdk.till(ctx, [61, 18, 63, 19])
-        await sdk.plant(ctx, "Parsnip Seeds", [61, 18, 63, 19])
-        await sdk.water(ctx)
-        return await sdk.find(ctx, "crops")
+        world, field = World(), Area(x1=61, y1=18, x2=63, y2=19)
+        await Screen().interact(ctx, [(3, 7)])  # the gift box with the starting seeds
+        await world.go(ctx, "Farm")
+        await world.gather(ctx, ["weeds", "stone", "twigs"], Area(x1=60, y1=17, x2=66, y2=21))
+        await world.till(ctx, field)
+        await world.plant(ctx, "Parsnip Seeds", field)
+        await world.water(ctx)
+        return await Here().find(ctx, "planted")
     finally:
         await driver.close()
 
 
 def test_first_morning():
     found = asyncio.run(first_morning())
-    assert any("Parsnip" in row for row in found["nearest"]), found
+    assert any("Parsnip" in t.f["name"] for t in found), found

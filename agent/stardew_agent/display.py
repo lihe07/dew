@@ -1,4 +1,4 @@
-"""What the terminal shows: one line per action, status only when it changes, the planner's scripts and thoughts kept short."""
+"""What the terminal shows: one line per action, status only when it changes, the agent's scripts and thoughts kept short."""
 
 from __future__ import annotations
 
@@ -26,7 +26,12 @@ class Display:
             self._spin(text)
             return
         self._unspin()
-        getattr(self, f"_{kind}", self._plain)(kind, text, data or {}, ok)
+        if kind == "status":
+            return self._status((data or {}).get("status") or {})
+        if kind in EVENTS:
+            return self.console.print(event_text(kind, text))
+        if kind not in ("agent", "script"):  # the full-screen view shows these as its activity line
+            getattr(self, f"_{kind}", self._plain)(kind, text, data or {}, ok)
 
     # --- kinds ---------------------------------------------------------------------------------------------
 
@@ -49,14 +54,12 @@ class Display:
         if not ok:
             self.console.print(Text("  " + text, "red"))
 
-    def _planner(self, kind, text, data, ok):
-        pass  # the full-screen view shows this as its activity line
-
-    def _script(self, kind, text, data, ok):
-        pass  # likewise
-
     def _wake(self, kind, text, data, ok):
         self.console.print(Text("⏸ woken: " + text, "grey62"))
+
+    def _query(self, kind, text, data, ok):
+        self.console.print(Text("query: " + (data.get("script") or "").split("\n")[0][:80], "blue"))
+        self.console.print(Text(text if self.verbose else text[:500], "grey70" if ok else "red"))
 
     def _docs(self, kind, text, data, ok):
         self.console.print(Text("◇ " + text, "blue"))
@@ -74,18 +77,6 @@ class Display:
 
     def _say(self, kind, text, data, ok):
         self.console.print(Text("» " + (text if self.verbose else text[:400]), "cyan"))
-
-    def _log(self, kind, text, data, ok):
-        self.console.print(event_text(kind, text))
-
-    def _judge(self, kind, text, data, ok):
-        self.console.print(event_text(kind, text))
-
-    def _safety(self, kind, text, data, ok):
-        self.console.print(event_text(kind, text))
-
-    def _busy(self, kind, text, data, ok):
-        self.console.print(event_text(kind, text))
 
     def _day(self, kind, text, data, ok):
         self.last = {}
@@ -157,7 +148,7 @@ def notes_text(text: str, data: dict, verbose: bool = False) -> str:
 
 def action_lines(data: dict, ok: bool, full: bool = False) -> list[Text]:
     """A finished action: one line, plus anything said or shown meanwhile. The one way an action is told: the view draws these,
-    and the planner reads their plain text (full: nothing cut short)."""
+    and the agent reads their plain text (full: nothing cut short)."""
     s, value, entries = data.get("status") or {}, data.get("value"), data.get("journal") or []
     line = Text(f"{clock(s.get('clock'))} ", "grey50")
     line.append(call_text(data["name"], data.get("args") or {}), "bold bright_white" if ok else "bold red")
@@ -168,7 +159,7 @@ def action_lines(data: dict, ok: bool, full: bool = False) -> list[Text]:
     places = [e["text"].removeprefix("entered ") for e in entries if e["kind"] == "place"]
     if len(places) > 1:
         line.append("  via " + " → ".join(places[:-1]), "grey50")
-    for name, amount in items(entries).items():
+    for name, amount in item_changes(entries).items():
         line.append(f"  {amount:+d} {name}", "green" if amount > 0 else "red")
     lines = [line]
     for e in entries:
@@ -193,28 +184,24 @@ def clock(value: Any) -> str:
     return f"{h % 24:02d}:{m:02d}"
 
 
-MAIN_ARGS = {"item", "target", "place", "person", "recipe", "question", "when"}  # shown without their name
+MAIN_ARGS = {"of", "target", "where", "what", "item", "who", "until"}  # shown without their name: the vocabulary, and what a method acts on
 
 
 def call_text(name: str, args: dict) -> str:
+    """Like "go Farm" or "chest.put Wood": a function by its name, a method as instance.method."""
+    owner, _, method = name.rpartition(".")
     shown = []
     for key, value in args.items():
         if value in (None, False, [], {}):
             continue
-        if key in ("area", "tiles") and isinstance(value, (list, tuple)):
-            value = area_text(value)
+        if isinstance(value, (list, tuple, set)) and not all(isinstance(v, int) for v in value):
+            value = ", ".join(map(str, value)) if len(value) <= 3 else f"{len(value)} {'tiles' if key == 'where' else 'of them'}"
         shown.append(str(value) if key in MAIN_ARGS else f"{key}={value}")
-    return f"{name} {' '.join(shown)}"[:80].strip()
-
-
-def area_text(value: list) -> str:
-    if len(value) == 4 and all(isinstance(v, int) for v in value):
-        return f"({value[0]},{value[1]})-({value[2]},{value[3]})"
-    return f"{len(value)} tiles"
+    return f"{owner.lower() + '.' if owner else ''}{method} {' '.join(shown)}"[:80].strip()
 
 
 def summarize(value: Any, full: bool = False) -> str:
-    """An action's result in a few words; full (for the planner) keeps every field, uncut."""
+    """An action's result in a few words; full (for the agent) keeps every field, uncut."""
     limit = None if full else 120
     if isinstance(value, dict):
         parts = [f"{k} {v}" for k, v in value.items() if (full or k not in QUIET_KEYS) and k != "items" and v not in (None, [], {}, "")]
@@ -224,14 +211,11 @@ def summarize(value: Any, full: bool = False) -> str:
     return "" if value in (None, "done", True) else str(value)[:limit]
 
 
-def items(entries: list[dict]) -> dict[str, int]:
+def item_changes(entries: list[dict]) -> dict[str, int]:
     """Item changes from the journal, added up."""
     out: dict[str, int] = {}
     for e in entries:
         if e["kind"] == "item":
             name, _, amount = e["text"].rpartition(" ")
-            try:
-                out[name] = out.get(name, 0) + int(amount)
-            except ValueError:
-                continue
+            out[name] = out.get(name, 0) + int(amount)
     return {k: v for k, v in out.items() if v}

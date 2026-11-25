@@ -1,4 +1,4 @@
-"""The planner's documentation: a tree of Markdown files in docs/, read with the docs tool and searched with search_docs.
+"""The agent's documentation: a tree of Markdown files in docs/, read with the docs tool and searched with search_docs.
 
 The system prompt lists only the root topics; each doc links to deeper ones by their path, like `docs("farming/crops")`.
 Each file starts with `# Title` and then a one-line summary; sections are `## Heading`.
@@ -17,14 +17,6 @@ def topics(folder: Path = DOCS) -> dict[str, Path]:
     """Every doc by its path without .md, like "farming" or "farming/crops"."""
     found = {p.relative_to(folder).with_suffix("").as_posix(): p for p in folder.rglob("*.md")}
     return dict(sorted(found.items()))
-
-
-def summary(path: Path) -> tuple[str, str]:
-    """A file's title and its one-line summary."""
-    lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
-    title = lines[0].lstrip("# ").strip() if lines else path.stem
-    rest = next((l for l in lines[1:] if not l.startswith("#")), "")
-    return title, rest
 
 
 def read(topic: str, folder: Path = DOCS) -> str:
@@ -67,3 +59,11 @@ def grep(pattern: str, folder: Path = DOCS) -> str:
         return f"nothing matches {pattern!r}"
     more = f"\n… {len(hits) - MAX_LINES} more; narrow the search" if len(hits) > MAX_LINES else ""
     return "\n".join(hits[:MAX_LINES]) + more
+
+
+def entry(name: str, folder: Path = DOCS) -> str | None:
+    """Where an SDK call is documented: topic#section, the section named after it (like `## go` or `## Chest.put`)."""
+    for topic, path in topics(folder).items():
+        if re.search(rf"(?m)^## {re.escape(name)}$", path.read_text()):
+            return f"{topic}#{name}"
+    return None

@@ -48,7 +48,7 @@ class Title:
         await self.click_ui(spots[index - await self.read("menu.raw.currentItemIndex")]["bounds.Center"])
         await self._wait_for_world()
 
-    async def new_game(self, name: str, farm: str, favorite: str, farm_type: str = "Standard") -> None:
+    async def new_game(self, name: str, farm: str, favorite: str) -> None:
         if await self.read("state.world"):
             raise ActionError("a save is already loaded")
         await self._title_button("New", "CharacterCustomization")
@@ -60,8 +60,6 @@ class Title:
             await self.d.run(d.input(text=text, clear=True), d.step(5))
         if not await self.read("menu.raw.skipIntro"):
             await self.click_component(field="skipIntroButton")
-        if farm_type != "Standard":
-            await self.click_component(name=farm_type)
         await self.click_component(field="okButton")
         await self._wait_for_world()
 

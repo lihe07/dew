@@ -399,20 +399,14 @@ internal sealed class FollowOp : IActiveOp
         if (ended != null)
             return this.Stop(ended, null);
         if (this.StopFor != "none" && this.Ticks % 4 == 0 && this.InTheWay() is { } who)
-        {
-            // someone stepped into the path: stop, so the caller can plan around them
-            JObject stop = this.Stop("blocked", null);
-            stop["by"] = who.Name;
-            stop["monster"] = who.Monster;
-            return stop;
-        }
+            return this.Blocked(who); // someone stepped into the path: stop, so the caller can plan around them
 
         if (Game1.player.CanMove && !Game1.fadeToBlack)
         {
             if (Vector2.Distance(Game1.player.Position, this.LastPosition) < 0.5f)
             {
                 if (++this.StuckTicks > 35)
-                    return this.Stop("stuck", null);
+                    return this.Touching() is { } pressed ? this.Blocked(pressed) : this.Stop("stuck", null);
             }
             else
                 this.StuckTicks = 0;
@@ -435,6 +429,27 @@ internal sealed class FollowOp : IActiveOp
             }
         }
         return null;
+    }
+
+    /// <summary>Someone pressed against the farmer, which InTheWay skips: a villager we block pushes through after a while, and we push into them.</summary>
+    private (string Name, bool Monster)? Touching()
+    {
+        Rectangle me = Game1.player.GetBoundingBox();
+        me.Inflate(4, 4);
+        foreach (var (name, box, monster) in Nav.Characters(this.Location))
+        {
+            if (this.StopFor != "none" && box.Intersects(me) && !(monster && this.StopFor == "people"))
+                return (name, monster);
+        }
+        return null;
+    }
+
+    private JObject Blocked((string Name, bool Monster) who)
+    {
+        JObject stop = this.Stop("blocked", null);
+        stop["by"] = who.Name;
+        stop["monster"] = who.Monster;
+        return stop;
     }
 
     private JObject Stop(string status, string? fired)

@@ -15,7 +15,7 @@ import time
 from dotenv import load_dotenv
 from pathlib import Path
 
-from stardew_agent import combat, work
+from stardew_agent import combat, look, work
 from stardew_agent.decide import Decider
 from stardew_agent.driver import Disconnected, Driver, find_session
 from stardew_agent.game import ActionError, Game
@@ -37,6 +37,24 @@ async def connect(realtime: bool = False) -> Game:
     raise SystemExit("the sandbox didn't come up")
 
 
+async def down(g, floors: int, tactics) -> dict:
+    """The mining docs' trip: descend, and break the nearest rocks until a ladder shows."""
+    g.guard.tactics = tactics
+    result = {"level": (await work.descend(g))["level"], "descended": 0}
+    for _ in range(floors * 20):
+        if result["descended"] >= floors:
+            break
+        f = await look.floor(g)
+        if f["ladders"] or f["shafts"]:
+            result["level"] = (await work.descend(g))["level"]
+            result["descended"] += 1
+        elif f["rocks"]:
+            await work.gather(g, [(r["x"], r["y"]) for r in f["rocks"][:3]])
+        else:
+            await work.fight(g)
+    return result
+
+
 async def trial(save: str, floors: int, tactics, realtime: bool = False) -> dict:
     subprocess.run([ROOT / "scripts/sandbox.sh", "stop"], capture_output=True)
     while subprocess.run(["pgrep", "-x", "StardewModdingA"], capture_output=True).returncode == 0:
@@ -56,7 +74,7 @@ async def trial(save: str, floors: int, tactics, realtime: bool = False) -> dict
     started = time.monotonic()
     outcome, result = "done", {}
     try:
-        result = await work.mine_down(g, floors, tactics=tactics)
+        result = await down(g, floors, tactics)
     except ActionError as ex:
         outcome = str(ex)
     after = await g.read({"health": "player.health", "energy": "player.energy", "minutes": "time.minutes", "level": "location.mine_level", "out": "state.passed_out",

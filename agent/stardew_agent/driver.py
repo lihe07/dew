@@ -92,7 +92,7 @@ class Driver:
         self._tasks: list[asyncio.Task] = []
         self._lock = asyncio.Lock()
 
-    async def connect(self, *, speed: int = 4, steal: bool = False, **_: Any) -> dict:
+    async def connect(self, *, speed: int = 4, steal: bool = False) -> dict:
         try:
             self.reader, self.writer = await asyncio.open_connection("127.0.0.1", self.port, limit=1 << 26)
         except OSError:
@@ -111,11 +111,13 @@ class Driver:
     async def run(self, *ops: Op) -> list[Any]:
         """Run instructions, and return their results."""
         async with self._lock:
+            message = {"ops": list(ops)}
             try:
-                reply = await self._request({"ops": list(ops)})
+                reply = await self._request(message)
             except asyncio.CancelledError:
-                # stop the farmer immediately
-                asyncio.ensure_future(self._quietly({"cancel": True}))
+                # stop the farmer now: this request, whether it runs already or still waits its turn in the game
+                if "id" in message:
+                    asyncio.ensure_future(self._quietly({"cancel": message["id"]}))
                 raise
         return reply["results"]
 
@@ -130,9 +132,6 @@ class Driver:
         """Run read and path instructions beside any running action. Returns the last result."""
         reply = await self._request({"ops": list(ops), "lane": "read"})
         return reply["results"][-1]
-
-    async def cancel(self) -> None:
-        await self._quietly({"cancel": True})
 
     async def _quietly(self, message: dict) -> None:
         try:

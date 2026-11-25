@@ -59,14 +59,14 @@ def engine() -> object:
 def main() -> None:
     import wasmtime
 
-    fuel, memory = int(sys.argv[1]), int(sys.argv[2])
+    fuel, memory, child = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]  # the child's code, from the runner (as its session started)
     e = engine()
     compiled = module(e)
     store = wasmtime.Store(e)
     store.set_fuel(fuel)
     store.set_limits(memory_size=memory)
     wasi = wasmtime.WasiConfig()
-    wasi.argv = ["python", "-I", "-c", CHILD.read_text()]
+    wasi.argv = ["python", "-I", "-c", child]
     wasi.inherit_stdin()
     wasi.inherit_stdout()
     wasi.inherit_stderr()

@@ -78,6 +78,8 @@ internal static class Views
                 ["craftable"] = r.doesFarmerHaveIngredientsInInventory()
             }).ToList(),
             "friends" => Villagers(p),
+            "bundles" => Bundles(),
+            "reads_junimo" => p.hasOrWillReceiveMail("canReadJunimoText"),
             "buff_names" => p.buffs.AppliedBuffs.Values.Select(b => b.displayName ?? b.id).ToList(),
             "mailbox_tile" => p.getMailboxPosition(),
             "bed_tile" => Utility.getHomeOfFarmer(p)?.GetPlayerBed()?.GetBedSpot(),
@@ -95,6 +97,46 @@ internal static class Views
             return true;
         value = null;
         return false;
+    }
+
+    /// <summary>The Community Center's bundles: which room, what each takes and what's been given, and whether its room's note is up.</summary>
+    private static List<Row> Bundles()
+    {
+        if (Game1.getLocationFromName("CommunityCenter") is not CommunityCenter cc)
+            return new List<Row>();
+        var given = cc.bundlesDict();
+        return Game1.netWorldState.Value.BundleData.Select(entry =>
+        {
+            string room = entry.Key.Split('/')[0];
+            int id = Convert.ToInt32(entry.Key.Split('/')[1]), area = CommunityCenter.getAreaNumberFromName(room);
+            string[] data = entry.Value.Split('/'), parts = ArgUtility.SplitBySpace(data[2]);
+            bool[] done = given.GetValueOrDefault(id) ?? new bool[parts.Length / 3];
+            var items = new List<Row>();
+            for (int i = 0; i + 2 < parts.Length; i += 3)
+            {
+                var ingredient = new BundleIngredientDescription(parts[i], Convert.ToInt32(parts[i + 1]), Convert.ToInt32(parts[i + 2]), done[i / 3]);
+                items.Add(new Row
+                {
+                    ["name"] = parts[i] == "-1" ? "gold" : ItemRegistry.GetDataOrErrorItem(JunimoNoteMenu.GetRepresentativeItemId(ingredient)).DisplayName,
+                    ["count"] = ingredient.stack,
+                    ["quality"] = ingredient.quality,
+                    ["given"] = ingredient.completed
+                });
+            }
+            int slots = ArgUtility.GetInt(data, 4, items.Count);
+            return new Row
+            {
+                ["id"] = id,
+                ["name"] = data.Length > 6 ? data[6] : data[0],
+                ["room"] = CommunityCenter.getAreaDisplayNameFromNumber(area),
+                ["area"] = area,
+                ["items"] = items,
+                ["slots"] = slots,
+                ["done"] = cc.isBundleComplete(id) || items.Count(i => (bool)i["given"]!) >= slots,
+                ["reward"] = string.IsNullOrWhiteSpace(data[1]) ? null : Utility.getItemFromStandardTextDescription(data[1], null)?.DisplayName,
+                ["open"] = area is >= 0 and < 6 && cc.shouldNoteAppearInArea(area)
+            };
+        }).ToList();
     }
 
     private static List<Row> Villagers(Farmer player)
@@ -234,7 +276,8 @@ internal static class Views
             "size" => new Point(l.Map.Layers[0].LayerWidth, l.Map.Layers[0].LayerHeight),
             "mine_level" => (l as MineShaft)?.mineLevel,
             "npcs" => l.characters.Where(p => p is not Monster && !p.IsInvisible).Concat(Game1.currentLocation == l && Game1.CurrentEvent != null ? Game1.CurrentEvent.actors : Enumerable.Empty<NPC>()).Select(NpcRow).ToList(),
-            "monsters" => l.characters.OfType<Monster>().Where(p => p.Health > 0).Select(p => new Row { ["name"] = p.displayName, ["x"] = p.TilePoint.X, ["y"] = p.TilePoint.Y, ["px"] = p.StandingPixel.X, ["py"] = p.StandingPixel.Y, ["hp"] = p.Health, ["damage"] = p.DamageToFarmer, ["hidden"] = p.IsInvisible, ["raw"] = p }).ToList(),
+            "monsters" => l.characters.OfType<Monster>().Where(p => p.Health > 0).Select(p => new Row { ["name"] = p.displayName, ["x"] = p.TilePoint.X, ["y"] = p.TilePoint.Y, ["px"] = p.StandingPixel.X, ["py"] = p.StandingPixel.Y, ["hp"] = p.Health, ["damage"] = p.DamageToFarmer, ["hidden"] = p.IsInvisible, ["unhurt"] = Unhurt(p), ["raw"] = p }).ToList(),
+            "projectiles" => l.projectiles.Where(p => !p.damagesMonsters.Value).Select(p => { var box = p.getBoundingBox(); return new Row { ["px"] = box.Center.X, ["py"] = box.Center.Y, ["vx"] = p.xVelocity.Value, ["vy"] = p.yVelocity.Value, ["raw"] = p }; }).ToList(),
             "animal_rows" => l.animals.Values.Select(p => new Row { ["name"] = p.displayName, ["kind"] = p.displayType, ["x"] = p.TilePoint.X, ["y"] = p.TilePoint.Y, ["petted"] = p.wasPet.Value, ["produce"] = p.currentProduce.Value, ["tool"] = p.GetAnimalData()?.HarvestTool, ["raw"] = p }).ToList(),
             "object_rows" => l.objects.Pairs.Select(p => ObjectRow(p.Key, p.Value)).ToList(),
             "terrain" => l.terrainFeatures.Pairs.Select(p => TerrainRow(p.Key, p.Value)).Concat(l.objects.Pairs.Where(p => p.Value is IndoorPot).Select(p => TerrainRow(p.Key, ((IndoorPot)p.Value).hoeDirt.Value))).ToList(),
@@ -249,6 +292,15 @@ internal static class Views
         };
         return Found(ref value);
     }
+
+    /// <summary>Whether the held weapon can't hurt this monster at all (not just its moment of invincibility after a hit): only dodge it.</summary>
+    private static bool Unhurt(Monster m) => m switch
+    {
+        Spiker => true,
+        Bug { isArmoredBug.Value: true } => !(Game1.player.CurrentTool is MeleeWeapon w && w.hasEnchantmentOfType<StardewValley.Enchantments.BugKillerEnchantment>()),
+        Mummy mummy => mummy.reviveTimer.Value > 0,
+        _ => false
+    };
 
     private static Row NpcRow(NPC p) => new() { ["name"] = p.displayName, ["internal"] = p.Name, ["x"] = p.TilePoint.X, ["y"] = p.TilePoint.Y, ["villager"] = p.IsVillager, ["raw"] = p };
 

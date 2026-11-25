@@ -1,5 +1,5 @@
 # Animals, machines and forage
-The other chores: pet, machines and forage, which work on everything in the current location.
+The other chores: pet, and collecting from machines and forage, which work on everything in the current location.
 
 ## pet
 `pet()`
@@ -13,28 +13,15 @@ r = pet()
 print("petted", len(r["petted"]))
 ```
 
-## machines
-`machines()`
+## Machines and forage
+Both are `gather` (`docs("gather")`): `gather("machines")` collects the finished output of every machine here (kegs, furnaces, preserves jars, bee houses, ...), and `gather("forage")` picks up the forage. Neither loads machines again: for that, hold the input with `screen.interact((x, y), item="...")` (`docs("screen#Screen.interact")`). `here.find("machines")` lists the ready ones here; `here.map()` marks them `READY: ...` in its notable list.
 
-Collects the finished output from every machine in the current location (kegs, furnaces, preserves jars, bee houses, ...), walking to each. It doesn't load them again: for that, hold the input with `screen("interact", tiles=[[x, y]], item="...")` (`docs("screen#interact")`).
-
-Returns `{"collected": n}`, plus `"unreachable"` and `"why"`. Raises `NotEnough` when the backpack is full.
-
-`find("machines")` lists machines here; `look_map()` marks the ready ones `READY: ...` in its notable list.
-
-## forage
-`forage()`
-
-Picks up every forage item in the current location (spring onions, leeks, daffodils, shells, mushrooms, ...), walking to each.
-
-Returns `{"collected": n}`, plus `"unreachable"` and `"why"`. Raises `NotEnough` (`your inventory is full (collected 4)`) when the backpack is full.
-
-Forage appears fresh each day in the Forest, the Mountain, the Beach, the Bus Stop, the Backwoods and town. It's free money and costs no energy: a round on the way somewhere is worth it. `find("forage")` lists what's here, nearest first. Berry bushes with berries (`find("berry_bushes")`) aren't forage: shake one with `screen("interact", tiles=[[x, y]])`, and the berries drop beside it to be walked over.
+Forage appears fresh each day in the Forest, the Mountain, the Beach, the Bus Stop, the Backwoods and town: a round on the way somewhere is worth it.
 
 ```python
 for place in ["Forest", "Town", "Mountain"]:
     go(place)
-    forage()
+    gather("forage")
 ```
 
-Selling or shipping forage: `docs("items/shops#sell")` and `docs("items/shipping")`.
+Selling or shipping forage: `docs("items/shops#Shop.sell")` and `docs("items/shipping")`.

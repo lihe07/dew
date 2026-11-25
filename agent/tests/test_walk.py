@@ -1,11 +1,12 @@
 """Walking around people, animals, and monsters, against a scripted fake game."""
 
 import asyncio
-import inspect
 
 import pytest
-from stardew_agent import combat
-from stardew_agent.game import SEGMENT, ActionError, Game, crowded
+from stardew_agent.combat import Guard
+from stardew_agent.common import crowded
+from stardew_agent.game import ActionError, Game
+from stardew_agent.navigation import SEGMENT
 
 
 class FakeDriver:
@@ -22,8 +23,13 @@ class FakeDriver:
         self.sent = []
 
     async def read(self, what):
+        if isinstance(what, dict) and "$grid" in what:  # open ground everywhere
+            x, y, w, h = what["$grid"]["rect"]
+            return {"x": x, "y": y, "pass": ["." * w] * h}
+        if isinstance(what, dict) and "from" in what:  # a query: the guard's look for monsters finds none
+            return self.state.get(what["from"], [])
         if isinstance(what, dict):
-            return {k: self.state[k] for k in what}
+            return {k: self.state.get(k) for k in what}
         return self.state.get(what)
 
     async def look(self, *ops):
@@ -48,7 +54,7 @@ class FakeDriver:
 
 
 def walk(driver, **kw):
-    return asyncio.run(Game(driver).goto([[2, 0]], **kw))
+    return asyncio.run(Game(driver).go([(2, 0)], **kw)).target
 
 
 def test_waits_for_a_person_then_goes_on():
@@ -76,10 +82,10 @@ def test_armed_fights_a_monster_in_the_way(monkeypatch):
                         state={"player.inventory": [{"kind": "Weapon"}], "monsters": [{"x": 1, "y": 0}]})
     fought = []
 
-    async def fight_off(self, ticks=240):
+    async def fight_off(self, g, radius, ticks):
         fought.append(ticks)
 
-    monkeypatch.setattr(Game, "fight_off", fight_off)
+    monkeypatch.setattr(Guard, "fight_off", fight_off)
     assert walk(driver) == (2, 0)
     assert fought == [240]
     assert all(op["n"] == SEGMENT for op in driver.ops("follow"))  # monsters about: plan again often
@@ -99,7 +105,7 @@ def test_follows_a_moving_target():
     async def track():
         return spots.pop(0)
 
-    assert asyncio.run(Game(driver).goto([[5, 0]], 8, track=track)) == (7, 0)
+    assert asyncio.run(Game(driver).go(track, beside=True)).target == (7, 0)
     assert all(op["n"] == SEGMENT for op in driver.ops("follow"))
 
 
@@ -113,7 +119,3 @@ def test_groups_of_monsters_are_walked_around():
     assert crowded([{"x": 5, "y": 5}], [], (0, 0)) == []
     tiles = crowded([{"x": 5, "y": 5}, {"x": 6, "y": 6}], [[6, 7]], (4, 4))
     assert [5, 5] in tiles and [7, 7] in tiles and [6, 7] not in tiles and [4, 4] not in tiles
-
-
-def test_keep_busy_signature():
-    assert list(inspect.signature(combat.keep_busy).parameters) == ["g", "stop", "orders"]

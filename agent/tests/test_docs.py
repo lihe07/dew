@@ -1,4 +1,4 @@
-"""The planner's documentation: the index, reading a topic or a section, and searching."""
+"""The agent's documentation: the index, reading a topic or a section, and searching."""
 
 from stardew_agent import docs
 
@@ -34,17 +34,11 @@ def test_search_finds_lines_with_their_topic_and_section(tmp_path):
     assert docs.grep("[unclosed", folder) == "nothing matches '[unclosed'"  # not a valid regex: searched as text
 
 
-def test_the_real_docs_have_titles_and_summaries():
-    for name, path in docs.topics().items():
-        title, about = docs.summary(path)
-        assert title and about, name
-
-
 def test_every_link_in_the_docs_and_the_prompt_resolves():
     import re
     from pathlib import Path
     here = Path(docs.__file__).parent
-    texts = {"prompts/planner.md": (here / "prompts" / "planner.md").read_text()} | {f"docs/{name}": path.read_text() for name, path in docs.topics().items()}
+    texts = {"prompts/agent.md": (here / "prompts" / "agent.md").read_text()} | {f"docs/{name}": path.read_text() for name, path in docs.topics().items()}
     broken = []
     for where, text in texts.items():
         for link in re.findall(r'docs\("([^"]+)"\)', text):

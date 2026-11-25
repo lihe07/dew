@@ -1,9 +1,9 @@
-"""The full-screen view: the day's Timeline (the planner's reasoning, its scripts, and each action's result, in order), the Plan
+"""The full-screen view: the day's Timeline (the agent's reasoning, its scripts, and each action's result, in order), the Plan
 (the running script, its current line marked), the Farmer (time, place, energy, health, gold), what the agent is doing now, and
 an input box to steer it. One tab per day.
 
 Keys: Tab focuses the Timeline or the Plan; ↑/↓, PgUp/PgDn, Home/End or the mouse wheel scroll it (End follows the newest again);
-←/→ switch days; type and Enter to queue a message for the planner; q quits when the agent is done.
+←/→ switch days; type and Enter to queue a message for the agent; q quits when the agent is done.
 """
 
 from __future__ import annotations
@@ -31,9 +31,10 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from .display import action_lines, clock, event_text, notes_text
+from .display import action_lines, clock, notes_text
 
 KEEP = 2000  # lines of actions kept per day
+INDENT = " " * 6  # under the time column: "07:10 "
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Day:
     report: str = ""
     running: str | None = None  # the action under way
     diary: str = ""
+    usage: dict | None = None  # the agent's usage once the day is over
 
 
 class TUI:
@@ -60,19 +62,23 @@ class TUI:
         self.typed = ""
         self.notice = ""
         self.on_steer: Callable[[str], None] = lambda text: None
-        self.queued: Callable[[], list[tuple[str, str]]] = lambda: []  # messages waiting for the planner
+        self.queued: Callable[[], list[tuple[float, str, str]]] = lambda: []  # messages waiting for the agent: (when, who, text)
+        self._arrived: dict[float, str] = {}  # the game time each queued message was first seen
+        self.waiting: Callable[[], list[str]] = lambda: []  # goals of the scripts in slots 2 and 3
+        self.line: Callable[[], int | None] = lambda: None  # the running script's line, live
         self._live: Live | None = None
         self._keys: threading.Thread | None = None
         self._saved: Any = None
         self._stop = threading.Event()
         self._quit: asyncio.Event | None = None
-        self.thinking_since: float | None = None  # the planner is waiting on the model
+        self.thinking_since: float | None = None  # the agent is waiting on the model
         self.script_live = False  # a script is running
         self.action_since = 0.0
         self.paused = False  # the player has control (F8)
-        self._woke: list[str] = []  # why the planner was woken, for its next turn's heading
+        self._woke: list[str] = []  # why the agent was woken, for its next turn's heading
+        self._turn = False  # a agent turn is going on (it may think several times, between tools)
         self.researching: tuple[str, float] | None = None  # the web question under way, and since when
-        self.usage: Callable[[], Any] = lambda: None  # the planner's usage, for the header
+        self.usage: Callable[[], Any] = lambda: None  # the agent's usage, for the header
         self.model = ""
         self.help = False
 
@@ -80,27 +86,51 @@ class TUI:
 
     def show(self, kind: str, text: str, data: dict | None = None, ok: bool = True) -> None:
         data, day = data or {}, self.days[-1]
+        at = clock(day.status.get("clock")).strip() or "     "
+
+        def entry(body: Text) -> None:  # a line with the game time in front
+            day.lines.append(Text(f"{at} ", "grey50") + body)
+
+        def under(body: Text) -> None:  # a line under the one above, in line with its text
+            day.lines.append(Text(INDENT) + body)
+
+        def started(goal: str | None, source: str) -> None:  # a script starts in slot 1: said once, by whichever step comes first
+            if not day.scripts or day.scripts[-1]["source"] != source or day.scripts[-1].get("line") is not None:
+                day.scripts.append({"goal": goal or "a script", "source": source, "line": None})
+                entry(Text(f"plan: {goal or ''}", "yellow"))
+
+        if data.get("usage"):
+            day.usage = data["usage"]
         if kind == "day":
             if day.title in ("starting", text):  # the same day again: a restart resumed it
                 day.title = text
             else:
                 self.days.append(Day(text))
+            self._turn, self._woke = False, []  # a new day: nothing from the last one woke this one
             self.scroll = 0
         elif kind == "report":
             day.report = text
-        elif kind == "planner":
-            if text == "thinking":  # a planner turn starts: one heading, saying what woke it
-                woke = " · ".join(dict.fromkeys(self._woke)) or "the day began"
-                at = clock(day.status.get("clock")).strip()
-                day.lines.append(Text("◆ Planner", "bold magenta") + Text(f" · woke: {woke}", "grey62") + Text(f" · {at}" if at else "", "grey42"))
+        elif kind == "status":
+            day.status.update(data.get("status") or {})
+        elif kind == "agent":
+            if text == "thinking" and not self._turn:  # a agent turn starts (not its next step after a tool): a blank line, then what woke it
+                self._turn = True
+                woke = ", ".join(dict.fromkeys(self._woke)) or ("the day began" if not day.scripts else "the agent went on")
+                if day.lines:
+                    day.lines.append(Text(""))
+                entry(Text(f"woke: {woke}", "grey62"))
                 self._woke = []
+            if text in ("waiting", "paused"):  # the turn is over: the next thinking is a new one
+                self._turn = False
             self.thinking_since = time.monotonic() if text == "thinking" else None
             self.researching = (data.get("question", ""), time.monotonic()) if text == "researching" else None
             self.paused = text == "paused"
             if text in ("paused", "resumed"):
-                day.lines.append(Text("⏸ you took control; the agent is paused" if text == "paused" else "▶ control given back; the agent goes on", "bold cyan"))
+                entry(Text("you took control; the agent is paused" if text == "paused" else "control given back; the agent goes on", "cyan"))
         elif kind == "script":  # the runner says when a script's process starts and ends
             self.script_live = text == "started"
+            if text == "started" and data.get("source"):
+                started(data.get("goal"), data["source"])
             if text == "ended":
                 day.running = None
         elif kind == "wake":
@@ -112,38 +142,53 @@ class TUI:
                 day.scripts[-1]["line"] = data["line"]
         elif kind == "result":
             day.running = None
-            day.lines += [nest(l) for l in action_lines(data, ok)] if data else [nest(Text(text[:300], "default" if ok else "red"))]
             if data.get("status"):
                 day.status.update(data["status"])
+            if not data:
+                return entry(Text(text[:300], "default" if ok else "red"))
+            first, *rest = action_lines(data, ok)
+            day.lines.append(first)  # it starts with its own time
+            for line in rest:  # what was said or shown meanwhile, e.g. "Abigail: Oh, hi."
+                under(Text(re.sub(r"^\s*(dialogue|chat): ", "", line.plain.strip()), "grey70" if "dialogue" in line.plain[:12] else "grey50"))
         elif kind == "plan" and not data.get("script") and ok and text in ("waiting", "nothing is running; the farmer keeps busy nearby"):
             pass  # waiting is what the activity line shows
-        elif kind == "plan" and data.get("script"):
-            day.scripts.append({"goal": data.get("goal") or "a script", "source": data["script"], "line": None})
-            day.lines.append(Text(f"⏺ Script {len(day.scripts)}", "bold yellow") + Text(f" · {data.get('goal') or ''}", "yellow"))
+        elif kind == "plan" and data.get("script"):  # the agent's run: shown when it starts (the runner's step), or here if queued or refused
             if not ok:
-                day.lines.append(nest(Text(text[:300], "red")))
+                entry(Text(f"plan refused: {data.get('goal') or ''}", "red"))
+                under(Text(text[:300], "red"))
+            elif data.get("queued"):
+                entry(Text(f"queued: {data.get('goal') or ''}", "grey62"))
+            else:  # it started now (a day recorded before the runner said so has only this)
+                started(data.get("goal"), data["script"])
         elif kind == "log":
             printed = text.removeprefix("printed: ").replace("\n", " ")
-            day.lines.append(nest(Text("“" + (printed[:140] + "…" if len(printed) > 140 else printed) + "”", "bright_cyan")))
-        elif kind in ("judge", "safety", "busy"):
-            day.lines.append(nest(event_text(kind, text)) if kind != "busy" else event_text(kind, text))
+            under(Text("\"" + (printed[:140] + "…" if len(printed) > 140 else printed) + "\"", "cyan"))
+        elif kind == "judge":
+            under(Text(text, "grey50"))
+        elif kind == "safety":
+            entry(Text(text.removeprefix("SAFETY: "), "yellow"))
+        elif kind == "busy":
+            entry(Text(text, "grey50"))
         elif kind == "think":
-            day.lines.append(Text("✻ ", "grey50") + Text(shorten(text, 2), "grey58 italic"))
+            pass  # the model's reasoning stays in the record; the timeline shows what it says
         elif kind == "say":
-            day.lines.append(Text("● ", "bright_white") + Text(shorten(text, 3), "bright_white"))
+            day.lines.append(Text(re.sub(r"\n\s*\n+", "\n", text.strip()), "bright_white"))  # flush left, in full, no blank lines
         elif kind == "docs":
-            day.lines.append(Text("◇ " + text, "blue"))
+            entry(Text(text, "grey50"))
         elif kind == "web":
-            day.lines.append(Text("◇ Web · ", "bold blue") + Text(data.get("question", ""), "blue"))
-            day.lines.append(Text(shorten(text, 4), "grey70" if ok else "red"))
+            entry(Text(f"web: {data.get('question', '')}", "blue"))
+            under(Text(shorten(text, 4), "grey70" if ok else "red"))
+        elif kind == "query":
+            entry(Text("query: " + (data.get("script") or "").strip().split("\n")[0][:80], "blue"))
+            for line in text.splitlines()[:6]:
+                under(Text(line[:200], "grey70" if ok else "red"))
         elif kind == "notes":
             if text.startswith("diary"):
                 day.diary = text.split(":", 1)[-1].strip()
             else:
-                day.lines.append(Text("✎ " + notes_text(text, data)[:300], "magenta" if ok else "red"))
+                entry(Text(notes_text(text, data)[:300], "magenta" if ok else "red"))
         else:
-            style = "red" if not ok or kind == "error" else "green"
-            day.lines.append(Text(("✗ " if style == "red" else "") + text[:300], style))
+            entry(Text(text[:300], "red" if not ok or kind == "error" else "green"))
         day.lines = day.lines[-KEEP:]
         self.refresh()
 
@@ -213,8 +258,9 @@ class TUI:
         index = len(self.days) - 1 if self.viewing is None else self.viewing
         day, live = self.days[index], index == len(self.days) - 1
         root = Layout()
-        queue = self._queue() if live else []
-        root.split_column(Layout(self._header(index), size=1), Layout(name="body"), Layout(Group(*queue), size=max(1, len(queue)), visible=bool(queue)),
+        queue = self._queue() if live else None
+        shown = min(len(self.queued()), 5) + (1 if len(self.queued()) > 5 else 0)
+        root.split_column(Layout(self._header(index), size=1), Layout(name="body"), Layout(queue or Text(""), size=shown + 2, visible=queue is not None),
                           Layout(self._activity(day, live), size=1), Layout(self._input(live), size=3), Layout(self._hint(), size=1))
         if self.help:
             root["body"].update(self._help())
@@ -237,17 +283,17 @@ class TUI:
         grid = Table.grid(expand=True)
         grid.add_column(no_wrap=True)
         grid.add_column(justify="right", no_wrap=True)
-        grid.add_row(Text(" dew ", "bold bright_white") + tabs, self._cost())
+        grid.add_row(Text(" dew ", "bold bright_white") + tabs, self._cost(None if index == len(self.days) - 1 else self.days[index].usage or {}))
         return grid
 
-    def _cost(self) -> Text:
-        """What the planner has used today: turns, tokens (and how much was cached), web lookups."""
-        u = self.usage()
+    def _cost(self, past: dict | None = None) -> Text:
+        """What the agent used on the day shown: turns, tokens (and how much was cached), web lookups. Today's is live."""
+        u = (past or None) if past is not None else vars(self.usage()) if self.usage() is not None else None
         if u is None:
             return Text("? help ", "grey42")
-        tokens = u.input + u.cached
-        hit = u.cached / max(1, tokens)
-        return Text(f"{self.model} · {u.turns} turns · {tokens / 1000:.0f}k tok ({hit:.0%} cached)" + (f" · {u.web} web" if u.web else "") + " · ? help ", "grey50")
+        tokens = u["input"] + u["cached"]
+        hit = u["cached"] / max(1, tokens)
+        return Text(f"{self.model} · {u['turns']} turns · {tokens / 1000:.0f}k tok ({hit:.0%} cached)" + (f" · {u['web']} web" if u["web"] else "") + " · ? help ", "grey50")
 
     def _timeline(self, day: Day) -> Panel:
         view = Rows(day.lines, self.scroll, lambda top: setattr(self, "_timeline_max", top))
@@ -257,16 +303,21 @@ class TUI:
         if not day.scripts:
             return self._panel(Text("no script yet", "grey50"), "Plan", "plan")
         script = day.scripts[-1]
-        at = script.get("line")
-        where = f"script {len(day.scripts)} · line {at} of {len(script['source'].strip(chr(10)).split(chr(10)))}" if at else f"script {len(day.scripts)}"
-        body = Code(script["goal"], script["source"], at, self.plan_top, self._plan_seen)
+        running = self.script_live and day is self.days[-1]
+        at = (self.line() if running else None) or script.get("line")  # the runner's line: it moves with every SDK call, facts too
+        script["line"] = at  # kept, so an ended script still shows where it stopped
+        total = len(script["source"].strip("\n").split("\n"))
+        where = f"script {len(day.scripts)} · " + (f"line {at} of {total}" if running and at else f"ended at line {at}" if at else "ended" if not running else "starting")
+        waiting = self.waiting()
+        after = [f"{'next' if i == 0 else 'then'}: {g}" for i, g in enumerate(waiting)] or (["next: nothing queued"] if day is self.days[-1] else [])
+        body = Code(script["goal"], script["source"], at, self.plan_top, self._plan_seen, after)
         return self._panel(body, "Plan", "plan", where)
 
     def _help(self) -> Panel:
         keys = Table.grid(padding=(0, 3))
         keys.add_column(style="bold bright_white", no_wrap=True)
         keys.add_column(style="grey70")
-        for key, does in (("type, Enter", "queue a message for the planner (it wakes, or reads it after its current thought)"),
+        for key, does in (("type, Enter", "queue a message for the agent (it wakes, or reads it after its current thought)"),
                           ("Tab", "switch the pane the keys scroll: Timeline or Plan"), ("↑ ↓, PgUp PgDn, wheel", "scroll it"),
                           ("Home / End", "the start / follow the newest again"), ("← →", "earlier and later days"),
                           ("F8, in the game", "take control (the agent pauses); F8 again gives it back"), ("q", "quit, once the agent is done"),
@@ -302,18 +353,23 @@ class TUI:
             grid.add_row(label, ProgressBar(total=top, completed=value, complete_style="bright_red" if low else style, finished_style=style, style="grey23"),
                          Text(f"{value}/{top}", "bright_red" if low else "default"))
         grid.add_row("gold", Text(f"{s.get('money', '?')}g"), "")
-        grid.add_row("pack", Text(f"{s.get('free', '?')} free" + (f" · {s['held']}" if s.get("held") else "")), "")
+        grid.add_row("pack", Text(f"{s.get('free', '?')} free"), "")
         if s.get("luck"):
             grid.add_row("luck", Text(str(s["luck"])), "")
         return self._panel(grid, "Farmer")
 
-    def _queue(self) -> list[Text]:
-        """Messages waiting for the planner, above the input as Claude Code shows queued messages."""
+    def _queue(self) -> Panel | None:
+        """Messages waiting for the agent, oldest first: what you sent and what the script printed. It reads them all when it next wakes."""
         items = self.queued()
-        rows = [Text(" ⧗ ", "grey50") + Text(f"{who}: ", "bold cyan" if who == "you" else "bright_cyan") + Text(text[:200], "grey70") for who, text in items[-4:]]
-        if len(items) > 4:
-            rows.insert(0, Text(f" ⧗ … {len(items) - 4} more waiting", "grey50"))
-        return rows
+        if not items:
+            return None
+        rows = []
+        for when, who, text in items[-5:]:
+            at = self._arrived.setdefault(when, clock(self.days[-1].status.get("clock")).strip() or "     ")
+            rows.append(Text(f"{at} ", "grey50") + Text(f"{who}: ", "bold cyan" if who == "you" else "cyan") + Text(text.replace("\n", " ")[:200], "grey70"))
+        if len(items) > 5:
+            rows.insert(0, Text(f"… and {len(items) - 5} earlier", "grey50"))
+        return Panel(Group(*rows), title="Queue", title_align="left", box=box.ROUNDED, border_style="grey35", padding=(0, 1))
 
     def _activity(self, day: Day, live: bool) -> Text:
         """What the agent is doing this moment."""
@@ -321,13 +377,15 @@ class TUI:
             return Text(" a past day · → comes back to today", "grey50")
         spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 8) % 10]
         line = Text(" ")
+        if self._quit is not None:  # the agent stopped: say so, plainly
+            return line.append("✓ " + self.notice, "bold green")
         if self.paused:
             return line.append("⏸ Paused", "bold cyan").append(" · you have control in the game · F8 gives it back", "grey50")
         if self.researching:
             question, since = self.researching
             return line.append(f"{spin} Researching", "bold blue").append(f" · “{question[:80]}” · {elapsed(since)}", "grey50")
         if self.thinking_since is not None:
-            line.append(f"{spin} Planner thinking", "bold magenta").append(f" · {elapsed(self.thinking_since)}", "grey50")
+            line.append(f"{spin} Agent thinking", "bold magenta").append(f" · {elapsed(self.thinking_since)}", "grey50")
             if self.script_live:
                 line.append(f" · meanwhile {self._where(day)}", "grey50")
         elif day.running:
@@ -335,7 +393,7 @@ class TUI:
         elif self.script_live:
             line.append(f"{spin} Script running", "yellow").append(f" · {self._where(day)}", "grey50")
         else:
-            line.append("⟳ Idle", "blue").append(" · guarding the farmer until the planner sends a script", "grey50")
+            line.append("⟳ Idle", "blue").append(" · guarding the farmer until the agent sends a script", "grey50")
         return line
 
     def _where(self, day: Day) -> str:
@@ -353,7 +411,7 @@ class TUI:
     def _hint(self) -> Text:
         if self.notice:
             return Text("  " + self.notice, "green")
-        return Text("  Enter sends to the planner · Tab pane · ↑↓ scroll · ←→ days · ? help"
+        return Text("  Enter sends to the agent · Tab pane · ↑↓ scroll · ←→ days · ? help"
                     + (f" · {self.header}" if self.header else ""), "grey42")
 
     # --- keys ------------------------------------------------------------------------------------------------
@@ -375,9 +433,9 @@ class TUI:
             if button in (64, 65):
                 self.focus = "timeline" if x < self.console.size.width * 0.6 else "plan"
                 self._scroll(3 if button == 64 else -3)
-        elif key in ("\x1b[D",):  # left
+        elif key == "\x1b[D":  # left
             self.viewing, self.scroll, self.plan_top = max(0, index - 1), 0, None
-        elif key in ("\x1b[C",):  # right
+        elif key == "\x1b[C":  # right
             self.viewing = None if index + 1 >= last else index + 1
             self.scroll, self.plan_top = 0, None
         elif key == "\x1b[A":
@@ -406,7 +464,7 @@ class TUI:
             text, self.typed = self.typed.strip(), ""
             if text:
                 self.on_steer(f"PLAYER: {text}")
-                self.notice = "queued for the planner; it reads it now, or right after its current thought"
+                self.notice = "queued for the agent; it reads it now, or right after its current thought"
         elif key in ("\x7f", "\b"):
             self.typed = self.typed[:-1]
         elif key.isprintable():
@@ -450,35 +508,29 @@ class Rows:
 class Code:
     """The running script, scrolled to its current line unless the reader scrolled it."""
 
-    def __init__(self, goal: str, source: str, line: int | None, top: int | None, report: Callable[[int, int], None]):
-        self.goal, self.source, self.line, self.top, self.report = goal, source.strip("\n"), line, top, report
+    def __init__(self, goal: str, source: str, line: int | None, top: int | None, report: Callable[[int, int], None], after: list[str] = ()):
+        self.goal, self.source, self.line, self.top, self.report, self.after = goal, source.strip("\n"), line, top, report, list(after)
 
     def __rich_console__(self, console: Console, options: Any):
         # drawn here rather than in a Group, which wouldn't pass the pane's height on
         goal = Text(self.goal, "yellow").wrap(console, options.max_width)
         yield from goal
         lines = self.source.split("\n")
-        room = max(3, (options.height or 12) - len(goal))
+        after = [line for text in self.after for line in Text(text, "grey62").wrap(console, options.max_width)]
+        room = max(3, (options.height or 12) - len(goal) - len(after))
         first = self.top or max(1, min((self.line or 1) - room // 3, len(lines) - room + 1))
         self.report(first, max(1, len(lines) - room + 1))
         yield Syntax(self.source, "python", line_numbers=True, theme="ansi_dark", background_color="default", word_wrap=False,
                      line_range=(first, first + room - 1), highlight_lines={self.line} if self.line else set())
+        yield from after
 
 
 def hang(console: Console, line: Text, width: int) -> list[Text]:
-    """Wrap a line so its continuation rows start under its text: past its indent, and past a leading marker like ✻."""
+    """Wrap a line so its continuation rows start under its text, past the time column."""
     plain = line.plain
-    indent = len(plain) - len(plain.lstrip(" "))
-    if plain[indent:indent + 2] in ("✻ ", "● ", "⏺ ", "◆ ", "✎ ", "✗ ", "✓ "):
-        indent += 2
+    indent = 6 if re.match(r"\d\d:\d\d |      ", plain) else 0  # continue in line with the text, after the time column
     rows = list(line.wrap(console, max(10, width - indent), overflow="fold"))
     return rows[:1] + [Text(" " * indent) + r for r in rows[1:]]
-
-
-def nest(line: Text) -> Text:
-    """A line under the script above it: flush left, like everything else."""
-    indent = len(line.plain) - len(line.plain.lstrip())
-    return line.divide([indent])[-1] if indent else line
 
 
 def minutes_since_6am(clock: int) -> int:

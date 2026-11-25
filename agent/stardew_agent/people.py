@@ -1,56 +1,38 @@
-"""Finding and talking to villagers."""
+"""Talking to villagers."""
 
 from __future__ import annotations
 
-from .common import ActionError, Interrupted, Tile, beside
-from .places import WORKPLACES
+from .common import ActionError, Interrupted, beside
 
 
 class People:
     """Mixin for Game: villagers."""
 
-    async def find_person(self, name: str) -> dict | None:
-        """Where someone is: villagers from the friendship list, others (shopkeepers like Marlon) from where they work."""
-        rows = await self.read({"from": "player.friends", "where": f"name == '{name}' or internal == '{name}'"})
-        if rows:
-            return rows[0]
-        here = await self.read("location.name")
-        for place in dict.fromkeys([here, WORKPLACES.get(name.title())]):
-            if place:
-                found = await self.read({"from": f"locations['{place}'].npcs", "where": f"name == '{name}' or internal == '{name}' or name == '{name.title()}'"})
-                if found:
-                    return {**found[0], "location": place}
-        return None
+    async def talk_all(self, names: list[str], gifts: dict[str, str]) -> list[dict]:
+        """Talk to several people, nearest first (visit looks again after each talk, since people walk about: a fresh greedy tour
+        beats a planned one that's stale by the second stop). Who can't be reached is noted, not raised."""
+        left, done = list(dict.fromkeys(names)), []
 
-    async def talk(self, name: str, gift: str | None = None) -> dict:
-        person = await self.find_person(name)
-        if not person:
-            raise ActionError(f"no one called '{name}' was found (people() lists the villagers)")
-        if not person.get("location"):
-            raise ActionError(f"{person['name']} isn't around today")
-        item = await self.find_item(gift) if gift else None
-        internal = person["internal"]
+        async def targets() -> list[str]:
+            return list(left)
 
-        async def where() -> list[Tile]:
-            return [(r["x"], r["y"]) for r in await self.read({"from": "location.npcs", "where": f"internal == '{internal}'", "select": ["x", "y"]})]
-
-        why = "they may be behind a counter or on the move"
-        for _ in range(8):
-            await self.ready()
-            person = await self.find_person(internal) or person
-            if await self.read("location.name") != person["location"]:
-                await self.travel(person["location"])
-                continue
+        async def act(name: str) -> None:
+            left.remove(name)
             try:
-                # they walk about, so keep heading for where they are now
-                if await self.goto(await where() or [(person["x"], person["y"])], 8, what=person["name"], track=where) is None:
-                    continue
+                done.append(await self.talk(name, gifts.get(name)))
             except Interrupted:
                 raise
             except ActionError as ex:
-                why = str(ex)
-                await self.step(30)
-                continue
+                done.append({"person": name, "failed": str(ex)})
+
+        visit = await self.visit(targets, act)
+        return done + [{"person": name, "failed": why} for name, why in visit.skipped.items()]
+
+    async def talk(self, name: str, gift: str | None = None) -> dict:
+        item = await self.find_item(gift) if gift else None
+        for _ in range(3):  # they may step away between arriving and speaking
+            person = (await self.go(name, beside=True)).person
+            internal = person.get("internal") or person["name"]
             await (self.hold(item["id"]) if item else self.empty_hands())
             now = await self.read({"npc": {"from": "location.npcs", "where": f"internal == '{internal}'", "select": ["x", "y"]}, "me": "player.tile"})
             if not now["npc"]:
@@ -64,8 +46,8 @@ class People:
             if opened:
                 await self.dialogue()
             await self.empty_hands()
-            after = await self.find_person(internal) or {}
+            after = (await self.read({"from": "player.friends", "where": f"name == '{internal}' or internal == '{internal}'"}) or [{}])[0]
             friend = "points" in person
             return {"person": person["name"], "hearts": after.get("hearts") if friend else None, "points": f"{person.get('points') or 0} -> {after.get('points') or 0}" if friend else None,
                     "note": None if opened else "had nothing to say"}
-        raise ActionError(f"couldn't get to {person['name']}: {why}")
+        raise ActionError(f"couldn't get to {name}: they kept moving away")

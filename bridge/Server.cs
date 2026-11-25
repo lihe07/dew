@@ -25,7 +25,8 @@ internal sealed class Client
     public readonly ConcurrentQueue<JObject> Requests = new();
     public bool Authenticated;
     public volatile bool Closed;
-    public volatile bool CancelRequested;
+    /// <summary>Requests to cancel, by id (-1: whichever runs now): the running one stops, a queued one never starts.</summary>
+    public readonly ConcurrentDictionary<long, bool> Cancelled = new();
 
     /// <summary>Read-only requests, answered even while an action runs.</summary>
     public readonly ConcurrentQueue<JObject> Reads = new();
@@ -157,7 +158,7 @@ internal sealed class Server
                     client.Send(new JObject { ["id"] = request["id"], ["results"] = new JArray() });
                 else if (request["cancel"] != null)
                 {
-                    client.CancelRequested = true;
+                    client.Cancelled[request["cancel"]!.Type == JTokenType.Integer ? (long)request["cancel"]! : -1] = true;
                     client.Send(new JObject { ["id"] = request["id"], ["results"] = new JArray() });
                 }
                 else if ((string?)request["lane"] == "read")

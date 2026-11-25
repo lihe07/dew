@@ -16,7 +16,7 @@ def hostile(monkeypatch, tmp_path, body: str):
 
 
 def test_a_process_that_stops_reading_is_ended(make_runner, acts, monkeypatch, tmp_path):
-    hostile(monkeypatch, tmp_path, "for _ in range(20000):\n    print(json.dumps({'call': 'money', 'args': []}), flush=True)\ntime.sleep(30)\n")
+    hostile(monkeypatch, tmp_path, "for _ in range(20000):\n    print(json.dumps({'call': 'Farmer.money', 'args': []}), flush=True)\ntime.sleep(30)\n")
     r, _ = make_runner()
     r.max_seconds = 2
     why = asyncio.run(run_script(r, "money()", timeout=10))
@@ -32,7 +32,7 @@ def test_a_log_flood_is_cut_off(make_runner, acts, monkeypatch, tmp_path, size, 
     assert len(r.trace) <= script.MAX_LOGS + 2 and all(len(t) < script.MAX_LOG_TEXT + 50 for t in r.trace)
 
 
-@pytest.mark.parametrize("message", ["[1]", "5", "null", "[" * 100000 + "]" * 100000, '{"call": "backpack", "args": ["bogus"]}', '{"call": "go", "args": [{"item": {}}]}'])
+@pytest.mark.parametrize("message", ["[1]", "5", "null", "[" * 100000 + "]" * 100000, '{"call": "Backpack.bogus"}', '{"call": "Chest.put", "self": 5, "args": ["Wood"]}'])
 def test_malformed_messages_end_the_script_with_a_reason(make_runner, acts, monkeypatch, tmp_path, message):
     hostile(monkeypatch, tmp_path, f"print({message!r}, flush=True)\ntime.sleep(5)\n")
     r, _ = make_runner()
@@ -41,7 +41,7 @@ def test_malformed_messages_end_the_script_with_a_reason(make_runner, acts, monk
 
 
 def test_long_text_from_the_process_is_cut(make_runner, acts, monkeypatch, tmp_path):
-    hostile(monkeypatch, tmp_path, "print(json.dumps({'ask': 'A' * 900000, 'line': 'x'}), flush=True)\n")
+    hostile(monkeypatch, tmp_path, "print(json.dumps({'error': 'A' * 900000, 'message': 'B' * 900000, 'line': 'x'}), flush=True)\n")
     r, _ = make_runner()
     why = asyncio.run(run_script(r, "money()", timeout=8))
     assert len(why[0]) < script.MAX_TEXT + 60

@@ -6,45 +6,35 @@ Game is assembled from mixins, one per area; this module holds the core (reading
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import driver as d
-from .common import (
-    FREE,
-    ActionError,
-    Interrupted,
-    Tile,
-    beside,
-    crowded,
-    label,
-    quality,
-)
+from .combat import Guard
+from .common import FREE, ActionError, Interrupted, Tile, beside, label
 from .driver import BridgeError, Driver
-from .events import Events, clean_dialogue, script_line, split_command
+from .events import Events
 from .items import Items
 from .menus import Menus
-from .moving import SEGMENT, Moving
+from .navigation import Navigation
 from .people import People
-from .places import PLACES, WORKPLACES
 from .rest import Rest
 from .title import Title
 from .trade import Trade
 
-if TYPE_CHECKING:
-    from . import combat
+SLICE = 10  # ticks between the guard's looks during a long wait
 
-__all__ = ["FREE", "PLACES", "SEGMENT", "WORKPLACES", "ActionError", "Game", "Interrupted", "Tile", "beside", "clean_dialogue", "crowded", "label", "quality", "script_line", "split_command"]
+__all__ = ["FREE", "ActionError", "Game", "Interrupted", "Tile", "beside", "label"]
 
 
-class Game(Moving, Items, Menus, Trade, Events, People, Rest, Title):
+class Game(Navigation, Items, Menus, Trade, Events, People, Rest, Title):
     def __init__(self, driver: Driver):
         self.d = driver
         self.journal: list[dict] = []
+        self.sales: list[str] = []  # today's shipping and selling, for the diary
         self.min_health = 0.3
-        self.why: str | None = None  # why targets were last unreachable
         self.keys: dict[str, str] = {}
         self.hotbar: list[str] = []
-        self.orders: combat.Orders | None = None  # limits for fights on the way
+        self.guard = Guard()  # the combat reflex, watching while any action runs
         driver.on_journal.append(self.journal.append)
 
     async def setup(self) -> None:
@@ -72,7 +62,18 @@ class Game(Moving, Items, Menus, Trade, Events, People, Rest, Title):
             pass
 
     async def step(self, n: int, until: dict[str, str] | str | None = None) -> dict:
-        return await self.d.one(d.step(n, until))
+        """Let n ticks pass (fewer if until fires). With monsters about, in slices, so the guard can pause the wait to fight."""
+        if n <= SLICE or not await self.guard.watch(self):
+            return await self.d.one(d.step(n, until))
+        ran = 0
+        while True:
+            result = await self.d.one(d.step(min(SLICE, n - ran), until))
+            ran += result["ticks"]
+            if result["fired"] or ran >= n:
+                return {"ticks": ran, "fired": result["fired"]}
+            if not await self.guard.watch(self):
+                result = await self.d.one(d.step(n - ran, until))
+                return {"ticks": ran + result["ticks"], "fired": result["fired"]}
 
     async def settle(self, n: int = 400) -> None:
         """Wait until the player can act, or something needs a decision."""
@@ -94,7 +95,7 @@ class Game(Moving, Items, Menus, Trade, Events, People, Rest, Title):
                     menu = await self.read("menu.type")
                     raise Interrupted(f"a menu needs your attention ({menu})")
             elif state.get("cutscene"):
-                await self.play_event()
+                await self.pass_event()
             elif state.get("minigame"):
                 raise Interrupted(f"a minigame is running ({await self.read('minigame.type')})")
             elif not await self.reel_in():
@@ -166,7 +167,3 @@ class Game(Moving, Items, Menus, Trade, Events, People, Rest, Title):
     async def click_tile(self, tile: Iterable[int], *, right: bool = False, after: int = 3) -> None:
         button = "mouse_right" if right else "mouse_left"
         await self.d.run(d.input(tile=tuple(tile), buttons=[]), d.step(2), d.input(buttons=[button]), d.step(2), d.input(buttons=[]), d.step(after))
-
-    def unreached(self, failed: list[Tile], limit: int = 20) -> dict:
-        """What to add to a result when for_nearest couldn't get to some targets."""
-        return {"unreachable": failed[:limit], "why": self.why} if failed else {}

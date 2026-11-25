@@ -107,10 +107,10 @@ internal sealed class Machine
             return;
         }
 
-        if (this.Client.CancelRequested)
+        if (!this.Client.Cancelled.IsEmpty)
         {
-            this.Client.CancelRequested = false;
-            if (this.Request != null)
+            bool any = this.Client.Cancelled.TryRemove(-1, out _);
+            if (this.Request != null && (any || this.Client.Cancelled.TryRemove((long?)this.Request["id"] ?? -2, out _)))
             {
                 Devices.Release();
                 this.Reply("cancelled");
@@ -181,6 +181,8 @@ internal sealed class Machine
             }
             catch (Exception ex)
             {
+                if (ex is not OpError)
+                    ModEntry.Log.Log($"Read failed:\n{ex}", LogLevel.Error);
                 message["error"] = ex is OpError ? ex.Message : $"internal error: {ex.GetType().Name}: {ex.Message}";
                 message["index"] = results.Count;
             }
@@ -191,8 +193,15 @@ internal sealed class Machine
     /// <summary>Take the next request, if any.</summary>
     private bool Next()
     {
-        if (!this.Client!.Requests.TryDequeue(out JObject? request))
-            return false;
+        JObject? request;
+        do
+        {
+            if (!this.Client!.Requests.TryDequeue(out request))
+                return false;
+            if (!this.Client.Cancelled.TryRemove((long?)request["id"] ?? -2, out _))
+                break;
+            this.Client.Send(new JObject { ["id"] = request["id"], ["results"] = new JArray(), ["error"] = "cancelled", ["index"] = 0 });  // cancelled before it began
+        } while (true);
         this.Request = request;
         this.Ops = this.Request["ops"] as JArray ?? new JArray();
         this.Results = new JArray();

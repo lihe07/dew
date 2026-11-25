@@ -1,4 +1,4 @@
-"""The guard, which runs while no script does: its safety reflexes, decided without the planner."""
+"""The guard, which runs while no script does: its safety reflexes, decided without the agent."""
 
 import asyncio
 from types import SimpleNamespace as NS
@@ -11,6 +11,7 @@ class FakeGame:
         self.d = NS(human=False)
         self.hp, self.mine, self.food = hp, mine, food
         self.did = []
+        self.guard = combat.Guard()
 
     async def read(self, what):
         if isinstance(what, dict) and "hp" in what:
@@ -25,8 +26,8 @@ class FakeGame:
         self.did.append(f"eat {name}")
         self.hp = 60
 
-    async def leave_mine(self):
-        self.did.append("leave the mine")
+    async def go(self, target):
+        self.did.append(f"go to {target}")
         self.mine = None
         self.hp = 100  # out of danger: nothing close is hurting it now
 
@@ -55,7 +56,7 @@ def test_hurt_with_food_it_eats(monkeypatch):
     g = FakeGame(hp=20, mine=40, food=True)
     g.hold_tool = lambda name: asyncio.sleep(0)
     asyncio.run(guard(g))
-    assert g.did[0] == "eat Carp" and "leave the mine" not in g.did
+    assert g.did[0] == "eat Carp" and "go to Mine" not in g.did
 
 
 def test_hurt_without_food_in_the_mines_it_leaves(monkeypatch):
@@ -63,7 +64,7 @@ def test_hurt_without_food_in_the_mines_it_leaves(monkeypatch):
     g = FakeGame(hp=20, mine=40, food=False)
     g.hold_tool = lambda name: asyncio.sleep(0)
     done = asyncio.run(guard(g))
-    assert g.did == ["leave the mine"] and done.get("left the mine") == 1
+    assert g.did == ["go to Mine"] and done.get("left the mine") == 1
 
 
 def test_a_menu_an_action_just_opened_stays_open():

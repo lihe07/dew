@@ -1,4 +1,4 @@
-"""Fakes for testing the planner and the plan runner without the game or a model."""
+"""Fakes for testing the agent and the plan runner without the game or a model."""
 
 import asyncio
 import copy
@@ -6,7 +6,8 @@ import inspect
 from types import SimpleNamespace as NS
 
 import pytest
-from stardew_agent import sdk, wasm_host
+from stardew_agent import api, wasm_host
+from stardew_agent.api.base import Api
 from stardew_agent.brain import Brain
 from stardew_agent.driver import BridgeError
 from stardew_agent.game import ActionError
@@ -19,7 +20,7 @@ needs_wasm = pytest.mark.skipif(bool(wasm_host.missing()), reason=f"scripts run 
 class FakeGame:
     def __init__(self, values=None):
         self.values = {"player.health": 100, "player.max_health": 100, "player.energy": 200, "player.max_energy": 270, "time.clock": 900, "location.name": "Farm",
-                       "player.money": 500, "player.free_slots": 12, "player.held": None,
+                       "player.money": 500, "player.free_slots": 12, "player.held": None, "player.friends": [],
                        "state": {"world": True}, "time.weekday": "Mon", "time.season": "spring", "time.day": 3, "time.text": "9:00 am", "player.tile": [1, 2], **(values or {})}
         self.values.setdefault("time", {"clock": self.values["time.clock"], "text": "9:00 am", "weather": "Sun", "weekday": "Mon", "season": "spring", "day": 3})
         self.d = NS(on_journal=[])
@@ -38,6 +39,12 @@ class FakeGame:
 
     async def inventory(self):
         return self.values.get("inventory", [])
+
+    async def find_item(self, query):
+        found = next((i for i in await self.inventory() if i["name"].lower() == query.lower()), None)
+        if not found:
+            raise ActionError(f"you don't have '{query}'")
+        return found
 
     async def open_shop(self):
         self.values["menu.type"] = "ShopMenu"
@@ -58,26 +65,30 @@ class FakeGame:
 
 @pytest.fixture
 def acts(monkeypatch):
-    """Fake SDK actions with the real signatures: each logs (name, its arguments), takes acts.seconds[name] (default 10ms),
-    returns acts.data[name], and raises ActionError(acts.errors[name]) if set."""
+    """Fake actions with the real signatures: each logs (wire name, its arguments: records as their short text, and "of" what a
+    method acts on), takes acts.seconds[name] (default 10ms), returns acts.data[name], and raises ActionError(acts.errors[name]) if set."""
     acts = NS(log=[], seconds={}, errors={}, checks=[], data={})
 
+    def shown(v):
+        return str(v) if isinstance(v, Api) else [shown(x) for x in v] if isinstance(v, list) else v
+
     def fake(name, real):
-        async def act(ctx, *args, **kwargs):
-            bound = inspect.signature(real).bind(ctx, *args, **kwargs)
+        async def act(me, ctx, *args, **kwargs):
+            bound = inspect.signature(real).bind(me, ctx, *args, **kwargs)
             for check in acts.checks:
                 check(name)
-            acts.log.append((name, dict(list(bound.arguments.items())[1:])))
+            acts.log.append((name, ({"of": me.ref["name"]} if "name" in me.ref else {}) | {k: shown(v) for k, v in list(bound.arguments.items())[2:]}))
             await asyncio.sleep(acts.seconds.get(name, 0.01))
             if name in acts.errors:
                 raise ActionError(acts.errors[name])
             return acts.data.get(name)
 
-        act.__signature__ = inspect.signature(real)
+        act.__signature__, act.kind = inspect.signature(real), "action"
         return act
 
-    for name, real in list(sdk.ACTIONS.items()):
-        monkeypatch.setitem(sdk.ACTIONS, name, fake(name, real))
+    for name, (cls, real) in list(api.CALLS.items()):
+        if real.kind == "action":
+            monkeypatch.setitem(api.CALLS, name, (cls, fake(name, real)))
     return acts
 
 
@@ -104,7 +115,11 @@ def make_runner(acts):
 
 
 def reply(*blocks, stop="tool_use"):
-    return NS(content=list(blocks), stop_reason=stop, usage=None)
+    """A model reply. One which runs a script also waits, as a agent does when it has nothing else to do meanwhile."""
+    blocks = list(blocks)
+    if any(getattr(b, "name", "") == "run" for b in blocks) and not any(getattr(b, "name", "") == "wait" for b in blocks):
+        blocks.append(call("wait", id="wait"))
+    return NS(content=blocks, stop_reason=stop, usage=None)
 
 
 def text(t="ok"):
@@ -124,14 +139,19 @@ def make_brain(monkeypatch, acts):
 
     def make(responses, decide=None, values=None, idle=None):
         ctx = Context(FakeGame(values), decide=decide, while_idle=idle)
-        b = Brain(ctx, api_key="x", model="m", system="s", web=False)  # no lookups: they would call the model
+        b = Brain(ctx, api_key="x", model="m", system="s")
         b.runner.poll = 0.05
         sent = []
 
         async def send():
             sent.append(NS(messages=copy.deepcopy(b.messages), current=b.runner.current and b.runner.current.name, log=list(acts.log)))
             await asyncio.sleep(0.05)
-            return responses.pop(0) if responses else reply(text(), stop="end_turn")
+            if not responses:  # out of replies: wait while a script runs, then the test's agent is done
+                if not b.runner.idle:
+                    return reply(call("wait", id="rest"))
+                ctx.finished = True
+                return reply(text(), stop="end_turn")
+            return responses.pop(0)
 
         monkeypatch.setattr(b, "_send", send)
         monkeypatch.setattr(b, "_shrink", lambda r: asyncio.sleep(0))
@@ -162,7 +182,7 @@ def names(acts):
 
 
 async def run_script(r, source, timeout=3, during=None, **options):
-    """Run a script to its end, doing during() meanwhile; returns why the planner was woken, and keeps the trace and images on r."""
+    """Run a script to its end, doing during() meanwhile; returns why the agent was woken, and keeps the trace and images on r."""
     r.start()
     await r.run(source, "test", **options)
     if during:

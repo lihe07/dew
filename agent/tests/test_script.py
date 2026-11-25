@@ -17,57 +17,58 @@ def text(r):
     return "\n".join(r.trace)
 
 
-@pytest.mark.parametrize("source, args", [
-    ("go('Beach')", {"target": "Beach"}),
-    ("go((3, 4), beside=True)", {"target": [3, 4], "beside": True}),
-    ("water(area=[0, 0, 2, 2])", {"area": [0, 0, 2, 2]}),
-    ("plant('Parsnip Seeds', tiles=[[1, 1]])", {"item": "Parsnip Seeds", "tiles": [[1, 1]]}),
-    ("fish(5)", {"casts": 5}),
-    ("buy('Parsnip Seeds', 15)", {"item": "Parsnip Seeds", "count": 15}),
-    ("take()", {}),
-    ("talk('Robin', gift='Wood')", {"person": "Robin", "gift": "Wood"}),
-    ("answer(1)", {"choice": 1}),
-    ("wait_until(minutes=30)", {"minutes": 30}),
-    ("screen('raw', ops=[{'op': 'step', 'n': 5}])", {"action": "raw", "ops": [{"op": "step", "n": 5}]}),
+@pytest.mark.parametrize("source, call, args", [
+    ("go('Beach')", "go", {"target": "Beach"}),
+    ("go((3, 4))", "go", {"target": [3, 4]}),
+    ("water(Area(0, 0, 2, 2))", "water", {"where": "(0,0)-(2,2)"}),
+    ("plant('Parsnip Seeds', [Tile(1, 1), (2, 1)])", "plant", {"item": "Parsnip Seeds", "where": ["(1,1)", [2, 1]]}),
+    ("fish(5)", "fish", {"casts": 5}),
+    ("wait(minutes=30)", "wait", {"minutes": 30}),
+    ("talk('Robin', gift='Wood')", "talk", {"who": "Robin", "gift": "Wood"}),
+    ("answer(1)", "answer", {"choice": 1}),
+    ("screen.raw([{'op': 'step', 'n': 5}])", "Screen.raw", {"ops": [{"op": "step", "n": 5}]}),
+    ("here.chests[0].put('Wood', 5)", "Chest.put", {"item": "Wood", "count": 5}),  # a method of a record, acting through its reference
+    ("backpack['Carp'].ship()", "Item.ship", {"of": "Carp"}),
 ])
-def test_sdk_calls_reach_their_actions(make_runner, acts, source, args):
-    r, _ = make_runner()
+def test_calls_reach_their_actions(make_runner, acts, source, call, args):
+    values = {"location.object_rows": [{"x": 64, "y": 15, "name": "Chest", "Items": [{"name": "Wood", "stack": 9}]}], "inventory": [{"name": "Carp", "stack": 3}]}
+    r, _ = make_runner(values=values)
     why = asyncio.run(run_script(r, source))
-    assert acts.log == [(source.split("(")[0], args)] and why == ["the script ended"]
+    assert acts.log == [(call, args)] and why == ["the script ended"]
 
 
 def test_a_call_of_the_wrong_shape_raises_type_error(make_runner, acts):
     r, _ = make_runner()
-    why = asyncio.run(run_script(r, "try:\n    fish(3, 4)\nexcept TypeError as e:\n    print('wrong:', e)\nmoney(1)"))
+    why = asyncio.run(run_script(r, "try:\n    fish(3, 4, 5)\nexcept TypeError as e:\n    print('wrong:', e)\nwait(1, 2, 3)"))
     assert not acts.log and why == ["the script raised TypeError at line 5"] and any(t.startswith("printed: wrong:") for t in r.trace)
 
 
-def test_actions_return_their_results_and_facts_read_live(make_runner, acts):
+def test_actions_return_their_results_and_fields_read_live(make_runner, acts):
     acts.data["fish"] = {"caught": 2, "fish": ["Carp", "Sunfish"]}
     values = {"player.money": 1840, "time.clock": 1430, "location.name": "Beach", "location.npcs": [{"name": "Willy"}], "player.free_slots": 0,
               "inventory": [{"name": "Carp", "stack": 3, "price": 30, "energy": 13, "category": -4}, {"name": "Wood", "stack": 50, "price": 2}]}
     r, _ = make_runner(values=values)
-    asyncio.run(run_script(r, "got = fish()\nprint(got['caught'], money(), time(), minutes_until_2am(), here(), people_here())\n"
-                              "print([f.name for f in backpack.fish], [f.name for f in backpack.food], backpack.free, backpack.full, backpack.items[1].count)"))
-    assert "printed: 2 1840 1430 690 Beach ['Willy']" in r.trace and "printed: ['Carp'] ['Carp'] 0 True 50" in r.trace
+    asyncio.run(run_script(r, "got = fish()\nprint(got['caught'], farmer.money, day.time, day.minutes_left, here.name, here.people)\n"
+                              "print([f.name for f in backpack.fish], [f.name for f in backpack.food], backpack.free, backpack.full, backpack.items[1].count, len(backpack))"))
+    assert "printed: 2 1840 1430 690 Beach [Person(Willy)]" in r.trace and "printed: ['Carp'] ['Carp'] 0 True 50 2" in r.trace
 
 
 def test_check_is_true_false_or_unsure(make_runner, acts):
     r, ctx = make_runner(decide=judge(("case0", 0.9), ("none", 0.8), ("case0", 0.4)))
-    why = asyncio.run(run_script(r, "if check('it is raining'):\n    fish()\nif check('the shop is open'):\n    buy('Seeds')\ncheck('a festival is on')\nforage()"))
+    why = asyncio.run(run_script(r, "if check('it is raining'):\n    fish()\nif check('the soil is dry'):\n    water()\ncheck('a festival is on')\nforage()"))
     assert names(acts) == ["fish"] and why == ["the script raised Unsure at line 5"]
     assert "Unsure: 'a festival is on' (confidence 0.40)\n  at line 5: check('a festival is on')" in text(r)
-    assert ctx.decide.asked[0] == {"case0": "it is raining", "none": script.Judge.NONE}
+    assert ctx.decide.asked[0] == {"case0": "it is raining", "none": script.NONE}
 
 
 def test_pick_chooses_among_options(make_runner, acts):
     values = {"inventory": [{"name": "Carp", "stack": 3, "price": 30, "energy": 13}, {"name": "Salad", "stack": 1, "price": 110, "energy": 113}],
               "menu.choices": ["Sure, I'll help", "Not now"]}
     r, ctx = make_runner(values=values, decide=judge(("case0", 0.9), ("case1", 0.8), ("case0", 0.2)))
-    why = asyncio.run(run_script(r, "eat(pick('the cheapest food', backpack.food))\nanswer('agree to help')\npick('anyone', ['Robin', 'Pam'])"))
-    assert acts.log[0] == ("eat", {"item": "Carp"})
+    why = asyncio.run(run_script(r, "pick('the cheapest food', backpack.food).eat()\nanswer('agree to help')\npick('anyone', ['Robin', 'Pam'])"))
+    assert acts.log[0] == ("Item.eat", {"of": "Carp"})
     assert acts.log[1] == ("answer", {"choice": 1})
-    assert ctx.decide.asked[0] == {"case0": "Carp: x3, 30g, +13 energy", "case1": "Salad: x1, 110g, +113 energy", "none": script.Judge.NONE}
+    assert ctx.decide.asked[0] == {"case0": "Carp: x3, 30g, +13 energy", "case1": "Salad: x1, 110g, +113 energy", "none": script.NONE}
     assert ctx.decide.states[0]["choosing"] == "the cheapest food"
     assert why == ["the script raised Unsure at line 3"]
 
@@ -93,19 +94,19 @@ def test_interruptions_become_questions_or_cutscenes():
 
 
 def test_caught_and_uncaught_exceptions(make_runner, acts):
-    acts.errors["buy"] = "the shop is closed: SeedShop opens at 9am"
+    acts.errors["talk"] = "Robin isn't around today"
     r, _ = make_runner()
-    why = asyncio.run(run_script(r, "try:\n    buy('Parsnip Seeds')\nexcept Closed as e:\n    print('closed:', e.reason)\n    go('JojaMart')\n    buy('Parsnip Seeds')\nfish()"))
-    assert names(acts) == ["buy", "go", "buy"] and why == ["the script raised Closed at line 6"]
-    assert "printed: closed: the shop is closed: SeedShop opens at 9am" in r.trace
-    assert any(" buy " in t and " — " in t for t in r.trace)  # a failed action: the reason after a dash
-    assert "Closed: the shop is closed: SeedShop opens at 9am\n  at line 6: buy('Parsnip Seeds')" in text(r)
+    why = asyncio.run(run_script(r, "try:\n    talk('Robin')\nexcept Closed as e:\n    print('closed:', e.reason)\n    go('Town')\n    talk('Robin')\nfish()"))
+    assert names(acts) == ["talk", "go", "talk"] and why == ["the script raised Closed at line 6"]
+    assert "printed: closed: Robin isn't around today" in r.trace
+    assert any(" talk " in t and " — " in t for t in r.trace)  # a failed action: the reason after a dash
+    assert "Closed: Robin isn't around today\n  at line 6: talk('Robin')" in text(r)
 
 
 def test_danger_is_raised_between_calls_and_mid_action(make_runner, acts):
-    r, _ = make_runner(values={"player.health": 25})
-    why = asyncio.run(run_script(r, "try:\n    mine()\nexcept LowHealth:\n    eat('Salad')\n    go('Farm')"))
-    assert names(acts) == ["eat", "go"] and why == ["the script ended"]
+    r, _ = make_runner(values={"player.health": 25, "inventory": [{"name": "Salad", "stack": 1, "energy": 113}]})
+    why = asyncio.run(run_script(r, "try:\n    mine.descend()\nexcept LowHealth:\n    backpack['Salad'].eat()\n    go('Farm')"))
+    assert names(acts) == ["Item.eat", "go"] and why == ["the script ended"]
     acts.log.clear()
     acts.seconds["fish"] = 3
     acts.checks.append(lambda name: acts.log and acts.seconds.update(fish=0.01))  # the second fish is quick
@@ -123,48 +124,36 @@ def test_danger_is_raised_between_calls_and_mid_action(make_runner, acts):
 def test_time_to_go_home_is_computed_once(make_runner, acts):
     r, ctx = make_runner(values={"time.clock": 2345})
 
-    async def minutes_home():
-        return 90
+    async def walk(target):
+        return 90 if target == "home" else None
 
-    ctx.game.minutes_home = minutes_home
+    ctx.game.minutes = walk
     why = asyncio.run(run_script(r, "try:\n    fish()\nexcept TimeToGoHome as e:\n    print(e.minutes_home, e.minutes_left)\n    go('Farm')\n    sleep()"))
     assert "printed: 90 135" in r.trace and names(acts) == ["go", "sleep"] and why == ["the script ended"]
 
 
 def test_stopped_cant_be_caught_and_a_new_run_replaces_the_old(make_runner, acts):
-    for finish in (False, True):
-        acts.log.clear()
-        acts.seconds["mine"] = 0.5
-        r, ctx = make_runner()
-        said = []
+    acts.seconds["Mine.descend"] = 0.5
+    r, ctx = make_runner()
+    said = []
 
-        async def replace():
-            await until(lambda: r.current is not None)
-            old = r.script
-            said.append(await r.run("fish()", "new", finish_current=finish))
-            await until(lambda: r.script is None and r.current is None and old.done.is_set())
+    async def replace():
+        await until(lambda: r.current is not None)
+        old = r.script
+        said.append(await r.run("fish()", "new", 1))
+        await until(lambda: r.script is None and r.current is None and old.done.is_set())
 
-        why = asyncio.run(run_script(r, "try:\n    mine()\n    mine()\nexcept Exception:\n    print('caught it')\nfight()", during=replace))
-        assert said[0].startswith("stopped the previous script")
-        assert names(acts) == ["mine", "fish"] and "printed: caught it" not in r.trace
-        assert any("the script stopped at line" in t for t in r.trace) and why == ["the script ended"]
-        assert ctx.game.released != finish
+    why = asyncio.run(run_script(r, "try:\n    mine.descend()\n    mine.descend()\nexcept Exception:\n    print('caught it')\nfight()", during=replace))
+    assert said[0].startswith("stopped the previous script")
+    assert names(acts) == ["Mine.descend", "fish"] and "printed: caught it" not in r.trace
+    assert any("the script stopped at line" in t for t in r.trace) and why == ["the script ended"]
 
 
-def test_budgets_stop_runaway_scripts(make_runner, acts, monkeypatch):
-    r, _ = make_runner()
-    why = asyncio.run(run_script(r, "while True:\n    money()"))
-    assert why == ["the script raised Surprise at line 2"] and "budget" in text(r)
+def test_busy_loops_are_killed(make_runner, acts, monkeypatch):
     r, _ = make_runner()
     r.limits["fuel"] = 5_000_000_000
     why = asyncio.run(run_script(r, "n = 0\nwhile True:\n    try:\n        n += 1\n    except BaseException:\n        pass", timeout=10))
     assert why == ["the script used too much computation (a busy loop?)"]
-
-
-def test_ask_ends_the_script_and_asks(make_runner, acts):
-    r, _ = make_runner()
-    why = asyncio.run(run_script(r, "fish()\nask('Should I buy the backpack?')\nfight()"))
-    assert names(acts) == ["fish"] and why == ["the script asks: Should I buy the backpack?"]
 
 
 @pytest.mark.parametrize("source, reason", [("x = [", "line 1: SyntaxError"), ("if True:\nprint(1)", "line 2: SyntaxError"), ("x = 1\n" * 5000, "longer than 20000")])
@@ -208,25 +197,25 @@ def test_idle_work_runs_while_no_script_does(make_runner, acts):
     assert "while idle: killed 1" in trace
 
 
-def test_the_planner_gets_rejections_and_wake_ups(make_brain, acts):
-    acts.seconds["mine"] = 0.3
-    b, ctx, sent = make_brain([reply(run_call("x = [")), reply(run_call("mine()\nprint('done')", id="c2"))])
+def test_the_agent_gets_rejections_and_wake_ups(make_brain, acts):
+    acts.seconds["Mine.descend"] = 0.3
+    b, ctx, sent = make_brain([reply(run_call("x = [")), reply(run_call("mine.descend()\nprint('done')", id="c2"))])
     asyncio.run(play(b))
     assert "run rejected, nothing changed: line 1: SyntaxError" in json.dumps(sent[1].messages[-1]["content"])
     woken = last_text(sent[2])
-    assert "09:00 mine\nprinted: done" in woken and "Woken because: the script ended" in woken
+    assert "09:00 mine.descend\nprinted: done" in woken and "Woken because: the script ended" in woken
 
 
 def test_a_look_script_answers_in_the_wake_up(make_brain, acts, monkeypatch):
     async def tile_map(g, radius, center):
         return {"location": "Farm", "map": f"radius {radius}: @..~"}
 
-    async def capture(g, size, radius, grid):
+    async def capture(g, radius, grid):
         return "IMG", {"scale": 0.5, "cropped": False}
 
     monkeypatch.setattr(look, "tile_map", tile_map)
     monkeypatch.setattr(vision, "capture", capture)
-    source = "print(look_map(8))\nscreenshot(radius=6)\ntry:\n    find('dragons')\nexcept TypeError as e:\n    print('no:', e)"
+    source = "print(here.map(8))\nscreen.shot(radius=6)\ntry:\n    here.find('dragons')\nexcept TypeError as e:\n    print('no:', e)"
     b, ctx, sent = make_brain([reply(run_call(source))])
     asyncio.run(play(b))
     woken = sent[1].messages[-1]["content"]
@@ -239,13 +228,13 @@ def test_a_look_script_answers_in_the_wake_up(make_brain, acts, monkeypatch):
 def test_the_prompt_examples_are_python_using_only_the_sdk():
     import ast
     import builtins
-    from stardew_agent import sandbox_child
+    from stardew_agent import api, sandbox_child
     here = Path(script.__file__).parent
-    prompt = (here / "prompts" / "planner.md").read_text()
+    prompt = (here / "prompts" / "agent.md").read_text()
     examples = re.findall(r"Example:\n```\n(.*?)```", prompt, re.S)
     if (here / "docs" / "examples.md").exists():
         examples += re.findall(r"```python\n(.*?)```", (here / "docs" / "examples.md").read_text(), re.S)
-    known = set(sandbox_child.SDK) | {"backpack", "pick", "print", "ask"} | set(sandbox_child.EXCEPTIONS) | set(dir(builtins))
+    known = set(sandbox_child.namespace(sandbox_child.Channel(), api.spec())) | set(dir(builtins))
     assert len(examples) >= 1
     for source in examples:
         vet(source)
@@ -324,12 +313,12 @@ def test_without_webassembly_scripts_are_refused(make_runner, acts, monkeypatch)
 
 
 def test_a_stopped_scripts_process_is_gone(make_runner, acts):
-    acts.seconds["mine"] = 5
+    acts.seconds["Mine.descend"] = 5
     r, _ = make_runner()
 
     async def go():
         r.start()
-        await r.run("mine()", "test")
+        await r.run("mine.descend()", "test")
         proc = r.script.proc
         await until(lambda: r.current is not None, 5)
         await r.interrupt("the PLAYER interrupted")
@@ -350,26 +339,18 @@ def test_the_wall_clock_ends_a_hung_action(make_runner, acts):
 
 def test_a_stopped_script_gets_nothing_more_done(make_runner, acts):
     r, ctx = make_runner()
-    opened = []
-
-    async def open_shop():
-        opened.append(True)
-
-    ctx.game.open_shop = open_shop
-    stale = script.Script("shop_stock()", "old", [], stopped="a new script replaced it")
+    stale = script.Script("here.shop.stock()", "old", [], stopped="a new script replaced it")
 
     async def go():
-        for name in ("shop_stock", "money", "go", "check"):
+        for message in ({"call": "Shop.stock", "self": {"place": "Farm"}}, {"call": "Farmer.money"}, {"call": "go", "args": ["Town"]}, {"call": "check", "args": ["x"]}):
             with pytest.raises(script.Stopped):
-                await r._sdk(stale, name, ["Town"] if name == "go" else ["x"] if name == "check" else [], {})
-        with pytest.raises(script.Stopped):
-            await r._stock(stale)
+                await r._sdk(stale, message)
 
     asyncio.run(go())
-    assert not opened and not acts.log
+    assert not acts.log
 
 
-def test_a_log_wakes_the_planner_while_the_script_runs(make_runner, acts, monkeypatch):
+def test_a_log_wakes_the_agent_while_the_script_runs(make_runner, acts, monkeypatch):
     monkeypatch.setattr(script, "WAKE_EVERY", 0.3)
     monkeypatch.setattr(script, "GATHER", 0.05)
     acts.seconds["fish"] = 0.8
@@ -391,3 +372,39 @@ def test_a_log_wakes_the_planner_while_the_script_runs(make_runner, acts, monkey
 
     assert asyncio.run(go()) == ["the script sent messages (it's still running)"]
 
+
+
+def test_scripts_queue_in_three_slots_and_run_one_after_another(make_runner, acts):
+    acts.seconds["Mine.descend"] = 0.3
+    r, ctx = make_runner()
+
+    async def go():
+        assert await r.run("mine.descend()", "first") == "started"
+        assert await r.run("fish()", "second") == "queued in slot 2"
+        assert await r.run("fish()", "third") == "queued in slot 3"
+        with pytest.raises(Rejected, match="full"):
+            await r.run("fish()", "fourth")
+        assert (await r.drop(3)).startswith("dropped slot 3")
+        await until(lambda: "fish" in names(acts) and r.script is None)
+
+    asyncio.run(go())
+    assert names(acts) == ["Mine.descend", "fish"]  # the second started on its own when the first ended
+
+
+def test_the_line_is_followed_in_pure_python_too(make_runner, acts):
+    r, _ = make_runner()
+    seen = set()
+
+    async def watch():
+        while r.script is not None:
+            seen.add(r.script.line)
+            await asyncio.sleep(0.02)
+
+    asyncio.run(run_script(r, "n = 0\nwhile n < 1_000_000:\n    n += 1\nfarmer.money", timeout=20, during=watch))
+    assert seen & {2, 3}  # inside the loop, before any SDK call
+
+
+def test_talk_takes_a_set_of_people(make_runner, acts):
+    r, _ = make_runner()
+    asyncio.run(run_script(r, "talk({'Haley', 'Alex'}, gift='Daffodil')"))
+    assert acts.log == [("talk", {"who": ["Alex", "Haley"], "gift": "Daffodil"})]

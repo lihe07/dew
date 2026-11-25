@@ -22,10 +22,9 @@ class Menus:
 
     async def backpack(self) -> list[dict]:
         grids = [g for g in await self.read("menu.inventories") or [] if g["player"]]
-        # some menus show the backpack twice; only this one takes clicks
-        for grid in sorted(grids, key=lambda g: g["field"] != "inventory"):
-            return grid["slots"]
-        raise ActionError("this menu doesn't show your inventory")
+        if not grids:
+            raise ActionError("this menu doesn't show your inventory")
+        return min(grids, key=lambda g: g["field"] != "inventory")["slots"]  # some menus show the backpack twice; only this one takes clicks
 
     async def stow_held(self) -> None:
         """Put the item on the cursor into the backpack."""
@@ -44,7 +43,7 @@ class Menus:
                 raise ActionError(f"your inventory is full, so {label(held)} was dropped at your feet")
             await self.click_ui(spot["at"])
 
-    async def close_menu(self, discard: bool = False) -> None:
+    async def close_menu(self) -> None:
         menu = await self.read({"type": "menu.type", "root": "menu.root", "source": "menu.raw.source", "choices": "menu.choices"})
         kind = menu["type"]
         if kind is None:
@@ -57,10 +56,10 @@ class Menus:
         if kind == "LetterViewerMenu":
             await self._close_letter()
             return
-        if kind == "ItemGrabMenu" and menu["source"] == 4 and not discard:
+        if kind == "ItemGrabMenu" and menu["source"] == 4:
             left = [s for grid in await self.read("menu.inventories") if not grid["player"] for s in grid["slots"] if s.get("item")]
             if left:
-                raise ActionError("closing this would destroy the items in it; take them first (trash(item) can make room)")
+                raise ActionError("closing this would destroy the items in it; take them first (item.trash() can make room)")
         if await self.read("menu.held") and kind != "InventoryPage":
             await self.stow_held()
         await self.step(180, "menu == null or menu.closable")

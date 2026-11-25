@@ -1,123 +1,117 @@
 # Facts
-Reading the game from a script: money, health, energy, here, state, find and its kinds, item_info, tile_info, exits, look_map, quests, recipes, shop_stock and screenshot.
+Reading the game from a script: farmer, day, here (find, map, info, exits, chests, people, shop), places, catalog, quests, recipes and people.
 
 ## Reading facts
-Facts only read; they never move the farmer or trigger the safety, but each is one SDK call (`docs("scripts#Budgets")`). Print them to see them yourself: the result comes with your next wake-up.
+`farmer`, `day`, `here`, `mine`, `backpack`, `people`, `quests`, `recipes`, `places` and `catalog` are objects read live: each field is read from the game when you use it, so read it again after an action to see the change (`backpack.free` after `gather`). Reading never moves the farmer or triggers the safety, and works in queries. Records they give (an Item, a Thing, a Person, a Chest) are a snapshot from when they were read, except a Person's `.tile`, which is read live. Print what you want to see yourself: it comes with your next wake-up.
 
-## money
-`money()`: your gold, an int.
+An unknown name (`people["Hailey"]`, `catalog["Parsnp"]`, `recipes["X"]`, `places["X"]`, an unknown `here.find` kind) raises `ActionFailed` with a "did you mean" list of the nearest exact names; `backpack["X"]` raises `NotEnough` when you have none.
 
-## health
-`health()`: current health, an int. The maximum is in the status line (`health 120/150`).
-
-## energy
-`energy()`: current energy, an int (270 at the start; more with stardrops).
-
-## here
-`here()`: the current location's game name, like `"Farm"`, `"SeedShop"`, `"Beach"`, `"UndergroundMine23"`.
-
-## time
-`time()` and `minutes_until_2am()`: see `docs("time#time")`.
-
-## state
-`state()`: a dict of the day's facts:
-| key | example |
+## farmer
+| field | what |
 |---|---|
-| `date` | `"Mon Spring 1, year 1 (27 days left in the season)"` |
-| `time` | `"6:10 am"` |
-| `weather` | `"Sun, tomorrow Rain"` |
-| `luck` | `"very good"`, `"good"`, `"neutral"`, `"bad"`, `"very bad"` |
-| `skills` | `{"farming": 1, "mining": 0, "foraging": 2, "fishing": 0, "combat": 0}` |
-| `free_inventory_slots` | `5` |
-| `buffs` | `["Speed"]` |
-| `farm_crops` | `"40 planted, 12 thirsty, 3 ready, 0 dead"` (the farm, from anywhere) |
-| `mail` | `"2 letter(s) in the mailbox at ... on the Farm"` with the mailbox's tile, or None |
-| `festival_today`, `at_festival` | True / the festival's name, or None |
-| `birthday_today` | `"Haley"`, or None |
-| `mine_level` | the mine floor you're on, or None |
-| `quests` | `["Introductions", "How To Win Friends (complete: collect the reward in the journal)"]` |
-| `menu` | the open menu, described as by `screen("look")`, or None |
+| `farmer.energy`, `farmer.max_energy` | energy now and at most (270 at the start; more with stardrops) |
+| `farmer.health`, `farmer.max_health` | health now and at most |
+| `farmer.money` | your gold, an int |
+| `farmer.place` | the current location's game name, like `"Farm"`, `"SeedShop"`, `"UndergroundMine23"` (the same as `here.name`) |
+| `farmer.tile` | where you stand, a Tile |
+| `farmer.held` | the Item in your hands, or None |
+| `farmer.skills` | `{"farming": 1, "mining": 0, "foraging": 2, "fishing": 0, "combat": 0}` |
 
 ```python
-s = state()
-if "Rain" in s["weather"].split(",")[0]:
-    print("rain today: no watering")
+if farmer.energy < 50 and backpack.food:
+    backpack.food[0].eat()
 ```
 
-## find
-`find(kind, name=None)`
+## day
+The clock, date, weather, luck, festival and birthday: see `docs("time#day")`.
 
-A list of `{"x": x, "y": y, "what": text}` in the current location, nearest first, at most 100. With `name`, only those whose `what` contains it (no case). Loop over it, slice it, or take `[0]` (check it isn't empty first). Raises `TypeError` for an unknown kind.
+## here
+`here` is the Place you're in (`docs("moving#Place fields")`), read live, with what's in it:
+- `here.name`, `here.title`: `"SeedShop"`, `"Pierre's General Store"`.
+- `here.people`: the Persons here now (people off the friendship list too, with `met` False).
+- `here.chests`: the Chests here, with what was in them (`docs("items/chests")`).
+- `here.shop`: the shop counter here, or None (`docs("items/shops")`).
+- `here.exits`: the ways out, as Things of kind `"exit"` named where they lead: `[e.name for e in here.exits]`.
+- `here.keeper`, `here.hours`, `here.open`: the shop's keeper and hours, if it's a well-known shop.
 
-| kind | finds | `what` |
+## Here.find
+`here.find(kind, name=None)`
+
+The Things of a kind in the current location, nearest first, at most 100; pass them (or some of them) to `gather` or `go` to act on them. Each Thing has `.kind`, `.name` (what it is, as text), `.x`, `.y` and `.tile`. With `name`, only those whose name contains it (no case). Loop over them, slice them, or take `[0]` (check the list isn't empty first). An unknown kind raises `TypeError`.
+
+Every kind `gather` takes finds the same things here, with the same names: `rocks`, `stone`, `ore`, `gems`, `boulders`, `trees`, `saplings`, `stumps`, `logs`, `twigs`, `weeds`, `grass`, `dead_crops`, `debris`, `forage`, `dig_spots`, `crops` (ripe), `items` (on the ground), `machines` (ready); the name is the thing's (for ore and gems, like `copper` or `ruby`). See `docs("gather#Kinds")`. Besides those:
+
+| kind | finds | name |
 |---|---|---|
-| `crops` | planted crops | the crop, `(ready)`, `(dead)` or `(4 days left)` |
-| `crops_ready` | crops ready to harvest | as above |
+| `planted` | every planted crop | the crop, `(dead)` or `(4 days left)` |
 | `crops_thirsty` | crops that need water today | as above |
 | `tilled_empty` | tilled soil without a crop | `dirt` |
 | `tillable` | diggable ground with nothing on it | `tillable` |
 | `water` | tiles to refill the can from | `water` |
-| `trees` | trees and fruit trees | `tree`, `fruit_tree` |
-| `forage` | forage to pick up | its name |
-| `artifact_spots` | artifact spots (dig with the hoe) | its name |
-| `stones`, `weeds`, `twigs` | small debris | name / kind |
-| `big_debris` | large stumps, logs, boulders | the kind, like `large stump` |
-| `chests` | chests (and gifts) | its name |
-| `machines` | machines | its name |
-| `objects` | every object except weeds, twigs and stones | its name |
+| `fruit_trees` | fruit trees | `fruit_tree` |
+| `objects` | every object except weeds, twigs and stones (machines too, ready or not) | its name |
 | `berry_bushes` | bushes with berries | the berries |
-| `people`, `monsters`, `animals` | who's here | the name |
+| `monsters`, `animals` | who's here | the name |
 | `buildings`, `furniture` | buildings, furniture | the name |
 | `exits` | exits and doors | where it leads |
 | `interactables` | things with an action (counters, signs, the mailbox) | the action |
 | `ladders` | mine ladders and shafts | `up`, `down`, `shaft` |
 
-```python
-spots = find("forage")
-print(len(spots), "forage here; nearest:", spots[:3])
-```
+Chests and people aren't kinds: `here.chests` and `here.people` give them as Chests and Persons, with their methods.
 
-## item_info
-`item_info(name)`
-
-What an item is, by name, whether or not you have it: `{"name", "id", "description", "category_name", "energy", "you_sell_for"}`, and for seeds a `"crop"`: `{"seasons": "spring", "days": 4, "regrows": "no, one harvest per seed", "gives": "Parsnip", "sells_for": 35}`. Raises `ActionFailed` for an unknown name (`no item called 'X'`). It doesn't say what a shop charges: use `shop_stock()`.
+In the mines, `mine` gives the floor's ladders, rocks and monsters (`docs("mining#mine")`).
 
 ```python
-print(item_info("Cauliflower Seeds")["crop"])
+spots = here.find("forage")
+print(len(spots), "forage here; nearest:", [(t.name, t.x, t.y) for t in spots[:3]])
 ```
 
-## tile_info
-`tile_info(x, y)`
-
-What's on one tile here: any of `"object"`, `"terrain"`, `"npc"`, `"exit"`, `"action"` (each the row the game reports), plus `"walkable"` (bool), `"water"` and `"diggable"` (True or None). Raises `ActionFailed` for a tile outside the map.
-
-## exits
-`exits()`: where the current location leads, one string each: `["Town via path (0,54)", "FarmHouse via door (64,15)"]`.
-
-## look_map
-`look_map(radius=14, center=None)`
+## Here.map
+`here.map(radius=14, center=None)`
 
 A text map around the farmer (or around `center`, a tile), `radius` tiles each way (3 to 45; at most 28 up and down), with x rulers on top and y numbers down the left, a legend of the symbols used, and a list of notable things with their tiles (buildings, exits, objects and machines with what they're making, people, monsters and animals). The same kind of map comes with every wake-up; this one is bigger. Print it to read it.
 
 Symbols: `@` you, `.` walkable, `#` blocked, `~` water, `T` tree, `t` sapling, `o` stone, `w` weeds, `/` twig, `"` grass, `S` stump/log/boulder, `h` tilled, `c` crop (dry), `v` crop (watered), `R` crop ready, `x` dead crop, `f` forage, `O` object/machine, `$` chest, `N` person, `M` monster, `A` animal, `D` door, `>` exit, `!` interactable, `F` furniture, `L` ladder, `B` bush, `%` building, `*` artifact spot.
 
 ```python
-print(look_map(20))
+print(here.map(20))
+```
+
+## Here.info
+`here.info(where)`
+
+What's on one tile here, as a TileInfo: `.walkable`, `.water`, `.diggable` (can be hoed), `.object` (its name), `.terrain` (its kind), `.npc` (who stands there), `.exit` (where it leads) and `.action` (a tile action, like a counter); each is None when there's nothing of it. Raises `ActionFailed` for a tile outside the map.
+
+```python
+t = here.info((64, 15))
+print(t.object, t.walkable)
+```
+
+## places
+`places["SeedShop"]` is a Place, by its game name (`docs("moving#Place names")`); iterating `places` gives every location. A Place's fields: `docs("moving#Place fields")`.
+
+## catalog
+`catalog["Parsnip Seeds"]`
+
+What an item is, by its exact name, whether or not you have it, as an ItemInfo: `.name`, `.id`, `.description`, `.category`, `.energy`, `.sells_for`, and for seeds a `.crop`: `{"seasons": "spring", "days": 4, "regrows": "no, one harvest per seed", "gives": "Parsnip", "sells_for": 35}` (None for other items). An unknown name raises `ActionFailed`. It doesn't say what a shop charges: use `shop.stock()` (`docs("items/shops#Shop.stock")`).
+
+```python
+print(catalog["Cauliflower Seeds"].crop)
 ```
 
 ## quests
-`quests()`: the quest log, a list of dicts with `"title"`, `"description"`, `"objectives"`, `"complete"`, `"reward"` (money, or None) and `"days_left"` (None if untimed); special orders have `"special": True`. Collect finished quests' money with `rewards()`, which returns `{"collected": "200g"}` (or `"nothing to collect"`).
+`quests` is the quest log: iterate it for Quest records, with `.title`, `.description`, `.objectives`, `.complete`, `.reward` (money, or None), `.days_left` (None if untimed) and `.special` (True for special orders).
+
+```python
+for q in quests:
+    print(q.title, "done" if q.complete else q.objectives)
+```
+
+## Quests.collect
+`quests.collect()`: collects the money of every finished quest, from the journal. Returns `{"collected": "200g"}`, or `"nothing to collect"`.
 
 ## recipes
-`recipes()`: what you can craft, one string each: `"Chest: <ingredients> [CAN CRAFT NOW]"` or `"... [missing ingredients]"`. Craft with `craft` (`docs("items#craft")`).
-
-## shop_stock
-`shop_stock()`: what the shop here sells; see `docs("items/shops#shop_stock")`.
+`recipes` is what you can craft: iterate it for Recipe records with `.name`, `.needs` (the ingredients) and `.can_make` (whether you have them now), or take one by name, `recipes["Chest"]`. Craft with `.craft()` (`docs("items#Recipe.craft")`).
 
 ## people
-`people()`, `people_here()`: see `docs("people#people")`.
-
-## screenshot
-`screenshot(radius=None, grid=False)`
-
-Takes a screenshot that you'll see at your next wake-up (the call returns a note, not the picture); people and things are labelled `name (x,y)`. `radius` (2 to 20) crops it around the farmer; `grid=True` overlays tile coordinates. For clicking at pixels with `screen("click", at=...)`, take it uncropped (`docs("screen#click")`). You can also take one yourself with the `screenshot` tool without disturbing the script.
+`people` and `here.people`: see `docs("people#people list")`.

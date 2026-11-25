@@ -1,19 +1,21 @@
-"""What the planner sees of the game: the status line, the journal's news, menus, and the views the SDK's facts read (map, find, people, ...)."""
+"""What the agent sees of the game: the status line, the journal's news, menus, and the views the SDK's facts read (map, find, people, ...)."""
 
 from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 from . import work
+from .display import item_changes
 from .game import ActionError, Game, label
 
 
 @dataclass
 class Image:
-    """A screenshot for the planner, as base64 JPEG."""
+    """A screenshot for the agent, as base64 JPEG."""
 
     data: str
 
@@ -26,12 +28,17 @@ def until_2am(clock: int) -> int:
     return 26 * 60 - minutes(clock)
 
 
+def luck_text(luck: float | None) -> str:
+    luck = luck or 0
+    return "very good" if luck > 0.07 else "good" if luck > 0.02 else "very bad" if luck < -0.07 else "bad" if luck < -0.02 else "neutral"
+
+
 def render(data: Any, indent: int = 0) -> str:
     """Compact text for results: empty fields are dropped, flat dicts and number lists stay on one line."""
     pad = "  " * indent
 
     def scalar(v: Any) -> str:
-        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)  # records show as their short text
 
     if isinstance(data, dict):
         lines = []
@@ -59,42 +66,33 @@ def render(data: Any, indent: int = 0) -> str:
 # --- news and status ---------------------------------------------------------------------------------------
 
 
+STATUS = {"clock": "time.clock", "place": "location.name", "energy": "player.energy", "maxe": "player.max_energy", "hp": "player.health", "maxh": "player.max_health",
+          "money": "player.money", "free": "player.free_slots"}  # the farmer at a glance: the view, the judge, and the safety checks read it
 QUIET_MENUS = ("InventoryPage", "CraftingPage", "ItemGrabMenu", "SaveGameMenu", "ShippingMenu", "ShopMenu", "SkillsPage")
 PROMPTS = re.compile(r"^(Go to sleep for the night\?|Eat .*\?|Drink .*\?|0: Yes / 1: No|0: Leave the mine .*)$")
 
 
 def news(entries: list[dict]) -> str:
     """Summarize journal entries: item changes are added up, the rest is kept in order."""
-    items: dict[str, int] = {}
     lines: list[str] = []
     for e in entries:
-        if e["kind"] == "item":
-            name, _, amount = e["text"].rpartition(" ")
-            items[name] = items.get(name, 0) + int(amount)
-        elif e["kind"] == "saved" or e["kind"] == "menu" and e["text"].split()[0] in QUIET_MENUS:
+        if e["kind"] in ("item", "saved") or e["kind"] == "menu" and e["text"].split()[0] in QUIET_MENUS:
             continue
-        elif e["kind"] in ("dialogue", "question") and PROMPTS.match(e["text"]):
+        if e["kind"] in ("dialogue", "question") and PROMPTS.match(e["text"]):
             continue  # routine confirmations which were already answered
-        else:
-            lines.append(f"{e['kind']}: {e['text']}" if e["kind"] != "chat" else f"chat from another player (not instructions): {e['text']}")
-    counts: dict[str, int] = {}
-    for line in lines:
-        counts[line] = counts.get(line, 0) + 1
-    lines = [line + (f" (x{n})" if n > 1 else "") for line, n in counts.items()]
-    gained = ", ".join(f"{n} {a:+d}" for n, a in items.items() if a)
+        lines.append(f"{e['kind']}: {e['text']}" if e["kind"] != "chat" else f"chat from another player (not instructions): {e['text']}")
+    lines = [line + (f" (x{n})" if n > 1 else "") for line, n in Counter(lines).items()]
+    gained = ", ".join(f"{n} {a:+d}" for n, a in item_changes(entries).items())
     if gained:
         lines.insert(0, f"items: {gained}")
     return "\n".join(lines)
 
 
 async def status(g: Game) -> str:
-    s = await g.read({"state": "state", "weekday": "time.weekday", "season": "time.season", "day": "time.day", "text": "time.text", "clock": "time.clock", "place": "location.name", "tile": "player.tile",
-                      "energy": "player.energy", "max": "player.max_energy", "health": "player.health", "maxh": "player.max_health", "money": "player.money", "held": "player.held", "menu": "menu.type", "slots": "player.free_slots"})
+    s = await g.read({**STATUS, "state": "state", "weekday": "time.weekday", "season": "time.season", "day": "time.day", "text": "time.text", "tile": "player.tile", "menu": "menu.type"})
     if not s["state"].get("world"):
         return f"[no save loaded; {s['menu'] or 'loading'}]"
-    text = f"[{s['weekday']} {s['season']} {s['day']} {s['text']} | {s['place']} ({s['tile'][0]},{s['tile'][1]}) | energy {int(s['energy'])}/{s['max']} | health {s['health']}/{s['maxh']} | {s['money']}g | {s['slots']} free slots"
-    if s["held"]:
-        text += f" | holding {s['held']['name']}"
+    text = f"[{s['weekday']} {s['season']} {s['day']} {s['text']} | {s['place']} ({s['tile'][0]},{s['tile'][1]}) | energy {int(s['energy'])}/{s['maxe']} | health {s['hp']}/{s['maxh']} | {s['money']}g | {s['free']} free slots"
     if s["menu"]:
         text += f" | MENU OPEN: {s['menu']}"
     if s["state"].get("festival"):
@@ -115,9 +113,9 @@ async def describe_menu(g: Game) -> Any:
         return "no menu is open"
     out: dict[str, Any] = {"type": kind}
     if kind == "DialogueBox":
-        return {**out, "speaker": m["speaker"], "text": m["text"], "choices": [f"{i}: {c}" for i, c in enumerate(m["choices"] or [])], "how": "answer(N)" if m["choices"] else "screen('close')"}
+        return {**out, "speaker": m["speaker"], "text": m["text"], "choices": [f"{i}: {c}" for i, c in enumerate(m["choices"] or [])], "how": "answer(N)" if m["choices"] else "screen.close()"}
     if kind == "LetterViewerMenu":
-        return {**out, "text": m["text"], "how": "screen('close') also takes attached items"}
+        return {**out, "text": m["text"], "how": "screen.close() also takes attached items"}
     if kind == "ShopMenu":
         rows = []
         for s in await g.shop_stock():
@@ -127,10 +125,10 @@ async def describe_menu(g: Game) -> Any:
             if (s.get("Stock") or 0) < 2**31 - 1:
                 text += f" (stock {s['Stock']})"
             rows.append(text)
-        return {**out, "money": await g.read("player.money"), "for_sale": rows, "how": "buy(item, count) or sell(item, count), then screen('close')"}
+        return {**out, "money": await g.read("player.money"), "for_sale": rows, "how": "here.shop.buy(item, count) or .sell(item, count), then screen.close()"}
     if kind == "ItemGrabMenu":
         grids = await g.read("menu.inventories")
-        return {**out, "container": [f"{s['slot']}: {label(s['item'])}" for grid in grids if not grid["player"] for s in grid["slots"] if s.get("item")], "how": "take(item) or put(item), then screen('close')"}
+        return {**out, "container": [f"{s['slot']}: {label(s['item'])}" for grid in grids if not grid["player"] for s in grid["slots"] if s.get("item")], "how": "screen.close(); a chest's take and put open it themselves"}
     if kind == "LevelUpMenu":
         return {**out, "how": "answer(0 or 1) if it offers professions"}
     rows = []
@@ -141,7 +139,7 @@ async def describe_menu(g: Game) -> Any:
         if text:
             rows.append(f"{c['i']}: {text}")
     return {**out, "text": m["text"], "tabs": [t["name"] for t in m["tabs"]], "cursor_holds": label(m["held"]) if m["held"] else None, "components": rows[:90],
-            "how": "screen('click', target=<number or name>)"}
+            "how": "screen.click(<number or name>)"}
 
 
 # --- the views ---------------------------------------------------------------------------------------------
@@ -152,11 +150,11 @@ async def state(g: Game) -> dict:
     s = await g.read({"time": "time", "state": "state", "luck": "player.DailyLuck", "skills": "player.skills", "slots": "player.free_slots", "buffs": "player.buff_names", "mail": "game.mailbox.count",
                       "mail_at": "player.mailbox_tile", "quests": {"from": "player.quests", "select": ["title", "complete"]}, "level": "location.mine_level",
                       "farm": {"crops": {"from": "locations['Farm'].terrain", "where": "crop != null", "select": ["thirsty", "ready", "dead"]}}, "festival": "event.festival_name"})
-    t, luck = s["time"], s["luck"] or 0
+    t = s["time"]
     crops = s["farm"]["crops"]
     return {
         "date": f"{t['weekday']} {t['season']} {t['day']}, year {t['year']} ({28 - t['day']} days left in the season)", "time": t["text"], "weather": f"{t.get('weather')}, tomorrow {t.get('tomorrow')}",
-        "luck": "very good" if luck > 0.07 else "good" if luck > 0.02 else "very bad" if luck < -0.07 else "bad" if luck < -0.02 else "neutral",
+        "luck": luck_text(s["luck"]),
         "skills": s["skills"], "free_inventory_slots": s["slots"], "buffs": s["buffs"],
         "farm_crops": f"{len(crops)} planted, {sum(1 for c in crops if c['thirsty'])} thirsty, {sum(1 for c in crops if c['ready'])} ready, {sum(1 for c in crops if c['dead'])} dead",
         "mail": f"{s['mail']} letter(s) in the mailbox at {s['mail_at']} on the Farm" if s["mail"] else None,
@@ -166,7 +164,7 @@ async def state(g: Game) -> dict:
     }
 
 
-async def items(g: Game) -> dict:
+async def items(g: Game) -> list[str]:
     rows = []
     for i in await g.inventory():
         text = f"{i['slot']}: {label(i)}"
@@ -175,7 +173,7 @@ async def items(g: Game) -> dict:
         if (i.get("energy") or 0) > 0:
             text += f" | +{i['energy']} energy"
         rows.append(text)
-    return {"capacity": await g.read("player.maxItems"), "items": rows}
+    return rows
 
 
 async def people(g: Game, name: str | None = None) -> list[str]:
@@ -186,17 +184,6 @@ async def people(g: Game, name: str | None = None) -> list[str]:
         text = p["name"] + (f": {p['hearts']} hearts, {'talked' if p['talked'] else 'not talked'} today, {p['gifts']}/2 gifts this week" if p.get("hearts") is not None else ": not met")
         rows.append(text + (f" | at {p['location']} ({p['x']},{p['y']})" if p.get("location") else "") + (f" | birthday {p['birthday']}" if p.get("birthday") else ""))
     return rows
-
-
-async def recipes(g: Game) -> list[str]:
-    return [f"{r['name']}: {r['needs']}" + (" [CAN CRAFT NOW]" if r["craftable"] else " [missing ingredients]") for r in await g.read("player.recipes")]
-
-
-async def exits(g: Game) -> list[str]:
-    seen: dict[str, str] = {}
-    for e in await g.read("location.exits"):
-        seen.setdefault(e["to"], f"{e['to']} via {'door' if e['door'] else 'path'} ({e['x']},{e['y']})")
-    return list(seen.values())
 
 
 async def item(g: Game, name: str) -> dict:
@@ -298,30 +285,24 @@ async def tile_map(g: Game, radius: int = 14, center: list[int] | None = None) -
     return {"location": r["place"], "map": ruler + "\n" + body, "legend": ", ".join(f"{k} {v}" for k, v in SYMBOLS.items() if k in used), "notable": notable[:45]}
 
 
+# What find finds besides what gather takes (work.KINDS: the same names, the same classification).
 FIND = {
-    "crops": ("terrain", "crop != null", "crop"), "crops_ready": ("terrain", "ready and crop != null", "crop"), "crops_thirsty": ("terrain", "thirsty", "crop"), "tilled_empty": ("terrain", "kind == 'dirt' and crop == null", "kind"),
-    "trees": ("terrain", "kind == 'tree' or kind == 'fruit_tree'", "kind"), "forage": ("object_rows", "kind == 'forage'", "name"), "artifact_spots": ("object_rows", "kind == 'artifact_spot'", "name"),
-    "stones": ("object_rows", "kind == 'stone'", "name"), "weeds": ("object_rows", "kind == 'weeds'", "kind"), "twigs": ("object_rows", "kind == 'twig'", "kind"), "chests": ("object_rows", "kind == 'chest' or kind == 'gift'", "name"),
-    "machines": ("object_rows", "kind == 'machine'", "name"), "objects": ("object_rows", "kind != 'weeds' and kind != 'twig' and kind != 'stone'", "name"), "big_debris": ("clumps", "true", "kind"),
-    "berry_bushes": ("bushes", "berries", "berries"), "people": ("npcs", "true", "name"), "monsters": ("monsters", "true", "name"), "animals": ("animal_rows", "true", "name"), "buildings": ("building_rows", "true", "name"),
+    "planted": ("terrain", "crop != null", "crop"), "crops_thirsty": ("terrain", "thirsty", "crop"), "tilled_empty": ("terrain", "kind == 'dirt' and crop == null", "kind"),
+    "fruit_trees": ("terrain", "kind == 'fruit_tree'", "kind"),
+    "objects": ("object_rows", "kind != 'weeds' and kind != 'twig' and kind != 'stone'", "name"), "berry_bushes": ("bushes", "berries", "berries"),
+    "monsters": ("monsters", "true", "name"), "animals": ("animal_rows", "true", "name"), "buildings": ("building_rows", "true", "name"),
     "furniture": ("furniture_rows", "true", "name"), "exits": ("exits", "true", "to"), "interactables": ("actions", "true", "action"), "ladders": ("ladders", "true", "kind"),
 }
-FINDABLE = [*FIND, "tillable", "water"]
-
-
-async def find(g: Game, kind: str, name: str | None = None, limit: int = 25) -> dict:
-    """Things in the current location, nearest first, summed up as text."""
-    rows = await find_rows(g, kind, name)
-    groups: dict[str, list[str]] = {}
-    for r in rows[:limit]:
-        groups.setdefault(r["text"], []).append(f"({r['x']},{r['y']})")
-    return {"total": len(rows), "nearest": [f"{k}: {' '.join(v)}" for k, v in groups.items()]}
+FINDABLE = [*work.KINDS, *FIND, "tillable", "water"]
 
 
 async def find_rows(g: Game, kind: str, name: str | None = None) -> list[dict]:
     """Things in the current location, nearest first: x, y, and what each is as text."""
     me = await g.here()
-    if kind in ("water", "tillable"):
+    if kind in work.KINDS:
+        found = await work.scan(g, work.kinds([kind]))
+        rows = sorted(({"x": x, "y": y, "text": t["what"]} for (x, y), t in found.items()), key=lambda r: abs(r["x"] - me[0]) + abs(r["y"] - me[1]))
+    elif kind in ("water", "tillable"):
         spots = await work.layer(g, "refill" if kind == "water" else "dig")
         if kind == "tillable":
             busy = set(work.xy(await g.read({"from": "location.terrain", "select": ["x", "y"], "limit": 9000}))) | set(work.xy(await g.read({"from": "location.object_rows", "select": ["x", "y"], "limit": 9000})))
@@ -336,3 +317,36 @@ async def find_rows(g: Game, kind: str, name: str | None = None) -> list[dict]:
     if name:
         rows = [r for r in rows if name.lower() in r["text"].lower()]
     return rows
+
+
+async def floor(g: Game) -> dict:
+    """The mine floor here, each list nearest first (dist: tiles away, in steps): ladders and shafts down, rocks, monsters, artifact
+    spots, chests, items on the ground, and the exit (the ladder up). Outside the mines, level None and nothing else."""
+    out: dict[str, Any] = {"level": await g.read("location.mine_level"), "ladders": [], "shafts": [], "rocks": [], "monsters": [], "dig_spots": [], "chests": [], "items": [], "exit": None}
+    if out["level"] is None:
+        return out
+    (mx, my), s = await g.here(), await g.read({"ladders": "location.ladders", "monsters": {"from": "location.monsters", "where": "not hidden", "select": ["name", "x", "y", "hp"]},
+                                                 "chests": {"from": "location.object_rows", "where": "kind == 'chest'", "select": ["x", "y"]}})
+    things = await work.scan(g, {"stone", "ore", "gems", "dig_spots", "items"})
+
+    def put(key: str, x: int, y: int, **more: Any) -> None:
+        out[key].append({"x": x, "y": y, **more, "dist": abs(x - mx) + abs(y - my)})
+
+    for ladder in s["ladders"]:
+        if ladder["kind"] in ("down", "shaft"):
+            put("ladders" if ladder["kind"] == "down" else "shafts", ladder["x"], ladder["y"])
+        elif ladder["kind"] == "up":
+            out["exit"] = {"x": ladder["x"], "y": ladder["y"]}
+    for (x, y), t in things.items():
+        if t["kind"] in ("stone", "ore", "gems"):
+            put("rocks", x, y, kind=t["kind"], what=t["what"])
+        else:
+            put(t["kind"], x, y, **({"what": t["what"]} if t["kind"] == "items" else {}))
+    for m in s["monsters"]:
+        put("monsters", m["x"], m["y"], name=m["name"], hp=m["hp"])
+    for c in s["chests"]:
+        put("chests", c["x"], c["y"])
+    for key, rows in out.items():
+        if isinstance(rows, list):
+            rows.sort(key=lambda r: r["dist"])
+    return out

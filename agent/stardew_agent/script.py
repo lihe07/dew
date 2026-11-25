@@ -1,4 +1,4 @@
-"""Plans as Python scripts: each runs in WebAssembly in its own process (wasm_host.py, sandbox_child.py), and the runner here carries out its SDK calls (sdk.py) in the game."""
+"""Plans as Python scripts: each runs in WebAssembly in its own process (wasm_host.py, sandbox_child.py), and the runner here carries out its calls to the API (api/) in the game."""
 
 from __future__ import annotations
 
@@ -10,30 +10,35 @@ import re
 import signal
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import wasm_host
+from . import api, combat, wasm_host
+from .api.base import Api, record
 from .driver import BridgeError, Disconnected, HumanControl
 from .game import ActionError, Game, Interrupted
 from .memory import Memory
 from .display import action_lines
-from .look import Image, minutes, news, render, status, until_2am
-from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
-from .sdk import ACTIONS, FACTS, recovers
+from .look import STATUS, Image, minutes, news, render, status, until_2am
+from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, Stuck, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
 
 SURE = 0.6  # the judge's least confidence for an answer to count
-MAX_CALLS = 200  # SDK calls per script
 MAX_MESSAGE = 1 << 20  # bytes in one message from a script
 LIMITS = {"fuel": 100_000_000_000, "memory": 256 << 20}  # per script: WebAssembly computation (Python's start takes about 3 billion, a second of work about 10) and memory
 MAX_SOURCE = 20_000  # characters
 MAX_SECONDS = 30 * 60  # real time per script
 MAX_LOGS = 200  # log lines per script
-WAKE_EVERY = 30  # seconds: a script's messages wake the planner at most this often; meanwhile they wait in the queue
-GATHER = 1.0  # seconds a message waits for more, before it wakes the planner
+WAKE_EVERY = 30  # seconds: a script's messages wake the agent at most this often; meanwhile they wait in the queue
+GATHER = 1.0  # seconds a message waits for more, before it wakes the agent
+QUEUE = 3  # script slots: the running one, and two waiting their turn
+STUCK_AFTER, STUCK_EVERY, SAMPLE = 10, 5, 2  # seconds: an action is first checked after this, then this often; positions every SAMPLE
+STUCK_SURE = 0.75  # how sure the judge must be, twice in a row: a false alarm costs a agent turn
+STUCK = ["the farmer is making progress: moving somewhere new, using energy on work, getting or selling items, or doing something that stays in one place by nature (fishing, fighting, sleeping, soaking, waiting, talking)",
+         "the farmer is stuck: standing or walking in place without getting anywhere, the same action failing again and again, "
+         "or going round in a loop (the same few actions or places over and over without anything changing)"]
 MAX_TEXT = 500  # characters kept of anything else the script's process says
 MAX_LOG_TEXT = 6000  # characters kept of one log line, enough for a map
 MAX_LOG_CHARS = 40_000  # logged characters per script
@@ -45,15 +50,15 @@ HOME_SLACK = 15  # game minutes to spare, arriving home by midnight
 
 @dataclass
 class Context:
-    """What the planner's tools, the runner, and the SDK share."""
+    """What the agent's tools, the runner, and the SDK share."""
 
     game: Game
-    memory: Memory = field(default_factory=Memory)  # the planner's lasting facts (remember, forget)
+    memory: Memory = field(default_factory=Memory)  # the agent's lasting facts (remember, forget)
     before_action: Callable[[], Awaitable[None]] | None = None
     shot: dict = field(default_factory=lambda: {"scale": 1.0, "cropped": False})  # the last screenshot's scale, for clicks at its pixels
     finished: bool = False  # the farmer slept: the day is over
     last_night: dict | None = None  # what the night screens showed
-    only_tools: set[str] | None = None  # when set, the planner's other tools are refused
+    only_tools: set[str] | None = None  # when set, the agent's other tools are refused
     while_idle: Callable[[asyncio.Event], Awaitable[dict]] | None = None  # work done while no script runs, until the event is set
     decide: Callable[[dict, dict[str, str]], Awaitable[tuple[str | None, float]]] | None = None  # the judge for check and pick
 
@@ -70,7 +75,7 @@ class Step:
 
 @dataclass
 class Outcome:
-    """What the planner reads of an action or a tool call."""
+    """What the agent reads of an action or a tool call."""
 
     text: str
     ok: bool = True
@@ -135,90 +140,55 @@ def interruption(what: str, choices: list[str] | None) -> Surprise:
 # --- facts and the judge -----------------------------------------------------------------------------------
 
 
+def stuck_facts(done: list[tuple[str, str, str]], samples: list[dict], now: float) -> dict:
+    """What the stuck check sees: recent actions and positions with their times, and counts worked out for it."""
+    recent = [x for x in samples if now - x["at"] <= 20]
+    before = {(x["place"], x["tile"]) for x in samples if now - x["at"] > 20}
+    steps = sum(abs(a["tile"][0] - b["tile"][0]) + abs(a["tile"][1] - b["tile"][1]) for a, b in zip(recent, recent[1:]) if a["place"] == b["place"])
+    still = 0.0
+    for x in reversed(samples):
+        if (x["place"], x["tile"]) != (samples[-1]["place"], samples[-1]["tile"]):
+            break
+        still = now - x["at"]
+    kinds = Counter(action for _, action, _ in done)
+    places = Counter((x["place"], x["tile"]) for x in samples)
+    return {
+        "recent_actions": [f"{t} {action}: {how}" for t, action, how in done],
+        "positions": [f"{x['clock']} {x['place']} {x['tile']} energy {x['energy']} money {x['money']} ({x['action']})" for x in samples],
+        "tiles_walked_last_20s": steps, "new_tiles_last_20s": len({(x["place"], x["tile"]) for x in recent} - before), "seconds_on_this_tile": round(still),
+        "energy_used_last_20s": (recent[0]["energy"] - recent[-1]["energy"]) if recent else 0,
+        "money_change_last_20s": (recent[-1]["money"] - recent[0]["money"]) if recent else 0,
+        "failures_in_recent_actions": sum(1 for _, _, how in done if how.startswith("failed")),
+        "most_repeated_action": f"{kinds.most_common(1)[0][0]} x{kinds.most_common(1)[0][1]}" if kinds else "none",
+        "most_revisited_tile": f"{places.most_common(1)[0][0]} x{places.most_common(1)[0][1]}" if places else "none",
+    }
+
+
 def facts(t: dict, s: dict) -> dict:
     """Ready-made, comparable facts for the judge: it compares well but can't do arithmetic."""
     weather = str(t.get("weather") or "")
     return {
         "time": t.get("text"), "minutes_until_2am": until_2am(t["clock"]), "day": f"{t.get('weekday')} {t.get('season')} {t.get('day')}",
         "weather": weather, "raining": "yes" if any(w in weather.lower() for w in ("rain", "storm")) else "no", "location": s["place"],
-        "health": f"{s['health']}/{s['maxh']}", "health_percent": round(100 * s["health"] / max(1, s["maxh"])),
+        "health": f"{s['hp']}/{s['maxh']}", "health_percent": round(100 * s["hp"] / max(1, s["maxh"])),
         "energy": f"{int(s['energy'])}/{s['maxe']}", "energy_percent": round(100 * s["energy"] / max(1, s["maxe"])),
-        "money": s["money"], "free_slots": s["slots"], "backpack_full": "yes" if s["slots"] == 0 else "no", "holding": (s.get("held") or {}).get("name"),
+        "money": s["money"], "free_slots": s["free"], "backpack_full": "yes" if s["free"] == 0 else "no", "holding": (s.get("held") or {}).get("name"),
     }
 
 
-FACTS_READ = {"time": "time", "place": "location.name", "health": "player.health", "maxh": "player.max_health", "energy": "player.energy", "maxe": "player.max_energy",
-              "money": "player.money", "slots": "player.free_slots", "held": "player.held"}
-
-
-class Judge:
-    """Says which of some options is the case, from the facts and what just happened."""
-
-    NONE = "None of these: something else is the case, or it isn't clear."
-
-    def __init__(self, ctx: Context, context: Callable[[], dict]):
-        self.ctx, self.context = ctx, context
-
-    async def which(self, options: list[str], extra: dict | None = None) -> tuple[int | None, float]:
-        """The index of the option which holds (None: none of them), and how sure the judge is."""
-        if not self.ctx.decide:
-            return None, 0.0
-        criteria = {f"case{i}": c for i, c in enumerate(options)} | {"none": self.NONE}
-        try:
-            now = await self.ctx.game.read(FACTS_READ)
-            known = facts(now["time"], now)
-        except (BridgeError, KeyError, TypeError) as ex:
-            known = {"status": f"unknown ({ex})"}
-        try:
-            key, sure = await self.ctx.decide({**self.context(), **known, **(extra or {})}, criteria)
-        except Exception:
-            return None, 0.0
-        return (int(key[4:]) if key and key.startswith("case") else None), sure
+FACTS_READ = {**STATUS, "time": "time", "held": "player.held"}
+NONE = "None of these: something else is the case, or it isn't clear."  # the judge's way out
 
 
 # --- what crosses to and from the script -------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Thing:
-    """An item as scripts see it."""
-
-    name: str
-    count: int = 1
-    price: int = 0  # numbers are 0 when the game gives none, so scripts can always do sums
-    energy: int = 0
-    healing: int = 0
-    category: str | None = None
-    water: int | None = None  # a watering can's water, and how much it holds
-    water_max: int | None = None
-    upgrade: int | None = None  # a tool's level: 0 basic, 1 copper, 2 steel, 3 gold, 4 iridium
-
-    def __str__(self) -> str:
-        return (f"{self.name}" + (f": x{self.count}" if self.count < 1_000_000 else "") + (f", water {self.water}/{self.water_max}" if self.water is not None else "")
-                + (f", {self.price}g" if self.price else "") + (f", +{self.energy} energy" if self.energy > 0 else ""))
-
-
-def thing(row: dict) -> Thing:
-    return Thing(row["name"], row.get("stack") or row.get("Stock") or 1, row.get("price") or row.get("Price") or 0, row.get("energy") or 0, row.get("healing") or 0,
-                 row.get("category_name") or (str(row["category"]) if row.get("category") is not None else None),
-                 row.get("water"), row.get("water_max"), row.get("upgrade"))
-
-
-def plain(value: Any) -> Any:
-    """An argument from the script: items stand for their names."""
-    if isinstance(value, dict):
-        return value["item"]["name"] if set(value) == {"item"} else {k: plain(v) for k, v in value.items()}
-    return [plain(v) for v in value] if isinstance(value, list) else value
-
-
 def wire(value: Any) -> Any:
-    return {"item": asdict(value)} if isinstance(value, Thing) else str(value)
+    return value.wire() if isinstance(value, Api) else str(value)
 
 
 def described(option: Any) -> str:
-    if isinstance(option, dict) and set(option) == {"item"}:
-        return str(Thing(**option["item"]))
-    return option if isinstance(option, str) else json.dumps(option, default=str)
+    return option if isinstance(option, str) else str(option) if isinstance(option, Api) else json.dumps(option, default=str)
 
 
 def text_of(value: Any, limit: int = MAX_TEXT) -> str:
@@ -238,13 +208,17 @@ def line_of(message: dict, last: int | None) -> int | None:
 _COMMAND: list[str] | None = None  # tests put a fake script process here
 
 
+CHILD = wasm_host.CHILD.read_text()  # the sandbox's code as this session started: later edits to the file can't reach a running session
+API = api.spec()  # what the sandbox builds a script's globals from
+
+
 def command(limits: dict) -> list[str]:
     """How to start a script's process: CPython for WASI under wasmtime. There's no other way, so without it scripts don't run."""
     if _COMMAND:
         return _COMMAND
     if why := wasm_host.missing():
         raise Rejected(f"scripts can't run on this computer yet: {why}")
-    return [sys.executable, "-I", str(Path(wasm_host.__file__)), str(limits["fuel"]), str(limits["memory"])]
+    return [sys.executable, "-I", str(Path(wasm_host.__file__)), str(limits["fuel"]), str(limits["memory"]), CHILD]
 
 
 def death(code: int | None, stderr: bytes) -> str:
@@ -258,10 +232,6 @@ def death(code: int | None, stderr: bytes) -> str:
 
 
 # --- running -----------------------------------------------------------------------------------------------
-
-
-STATUS = {"clock": "time.clock", "place": "location.name", "energy": "player.energy", "maxe": "player.max_energy", "hp": "player.health", "maxh": "player.max_health",
-          "money": "player.money", "free": "player.free_slots"}  # what the display shows after an action
 
 
 @dataclass
@@ -291,13 +261,14 @@ class Script:
     proc: Any = None
     task: asyncio.Task | None = None
     started: float = 0
-    calls: int = 0
     logged: int = 0  # lines
     chars: int = 0  # logged characters
     line: int = 0
     stopped: str | None = None
-    outcome: tuple = ()  # how it ended: done, ask, error, killed, or stopped
+    outcome: tuple = ()  # how it ended: done, error, killed, or stopped
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    query: bool = False  # a read-only script beside the running one: its prints are its answer
+    output: list[str] = field(default_factory=list)
 
     def stop(self, why: str) -> Stopped:
         """Mark it stopped on purpose; returns the Stopped to raise."""
@@ -306,7 +277,7 @@ class Script:
 
 
 class Runner:
-    """Plays scripts in sandboxed processes, one action at a time, keeps the farmer safe and busy, and wakes the planner when a script ends."""
+    """Plays scripts in sandboxed processes, one action at a time, keeps the farmer safe and busy, and wakes the agent when a script ends."""
 
     def __init__(self, ctx: Context, emit: Callable[[Step], None], wake: Callable[[], None], poll: float = 2):
         self.ctx, self.emit, self.on_wake, self.poll = ctx, emit, wake, poll
@@ -315,10 +286,9 @@ class Runner:
         self.current: Job | None = None
         self.count = 0
         self.error: BaseException | None = None  # the player took control, or the game went away
-        self.judge = Judge(ctx, self._context)
         self._lock = asyncio.Lock()  # one action at a time, across scripts
         self._owner: Script | None = None  # whose action is running
-        self._trace: list[str] = []  # what the planner hasn't been told yet
+        self._trace: list[str] = []  # what the agent hasn't been told yet
         self._images: list[Image] = []
         self._why: list[str] = []
         self._heard: deque[str] = deque(maxlen=8)
@@ -330,9 +300,15 @@ class Runner:
         self._job: asyncio.Task | None = None
         self._cancel: BaseException | None = None  # what a cancelled action raises
         self._listening = False
-        self._woken_for_messages = -WAKE_EVERY  # when messages last woke the planner
-        self._queued = False  # messages the planner hasn't been woken for
-        self.printed: list[str] = []  # what the script printed, until the planner reads it
+        self._woken_for_messages = -WAKE_EVERY  # when messages last woke the agent
+        self._done: deque[tuple[str, str, str]] = deque(maxlen=12)  # the last actions, for the stuck check: (game time, action, how it went)
+        self._finished: deque[float] = deque(maxlen=4)  # when the last few actions ended, to tell a run of short ones
+        self._samples: deque[dict] = deque(maxlen=15)  # every SAMPLE seconds during an action: game time, place, tile, energy, money, action
+        self._sampled = self._asked = 0.0  # when the farmer was last sampled, and the stuck check last asked
+        self._strikes = 0  # the stuck check's "stuck" verdicts in a row
+        self._queued = False  # messages the agent hasn't been woken for
+        self.waiting: list[tuple[str, str]] = []  # scripts in slots 2 and 3: (source, goal)
+        self.printed: list[tuple[float, str]] = []  # what the script printed (and when), until the agent reads it
         self._message_timer: asyncio.TimerHandle | None = None
 
     # --- control -------------------------------------------------------------------------------------------
@@ -349,22 +325,88 @@ class Runner:
             self.error = None
             self._task = asyncio.create_task(self._main())
 
-    async def run(self, source: str, goal: str, finish_current: bool = False) -> str:
-        """Start a script, replacing the one running. Raises Rejected for a script which won't run."""
+    async def run(self, source: str, goal: str, slot: int | str = "next") -> str:
+        """Put a script in a slot: 1 is the running one (replaced now), 2 and 3 wait their turn, "next" appends (or starts it, if
+        nothing runs). Raises Rejected for a script which won't run, or a slot which can't take it."""
         vet(source)
+        if slot in (1, "1", "now"):
+            return await self._start(source, goal)
+        if slot in (2, 3, "2", "3"):
+            i = int(slot) - 2
+            if i > len(self.waiting):
+                raise Rejected(f"slot {i + 1} is empty, so it can't take slot {i + 2}: use slot {len(self.waiting) + 2} or \"next\"")
+            if i < len(self.waiting):
+                self.waiting[i] = (source, goal)
+                return f"replaced slot {i + 2}"
+            slot = "next"
+        if slot != "next":
+            raise Rejected('slot is 1, 2, 3, or "next"')
+        if self.script is None:  # nothing runs: it starts now
+            return await self._start(source, goal)
+        if len(self.waiting) >= QUEUE - 1:
+            raise Rejected(f"the queue is full ({QUEUE} slots: the running script and {QUEUE - 1} waiting): drop one, or replace a slot")
+        self.waiting.append((source, goal))
+        return f"queued in slot {len(self.waiting) + 1}"
+
+    async def drop(self, slot: int) -> str:
+        """Delete a slot: 1 stops the running script (the next one starts), 2 and 3 delete what waits there."""
+        if slot == 1:
+            if not self.script:
+                return "slot 1 is empty: nothing is running"
+            await self._stop_script(self.script, "you dropped it")
+            return "stopped slot 1; " + (await self._start_next() if self.waiting else "nothing waits")
+        if slot not in (2, 3) or slot - 2 >= len(self.waiting):
+            return f"slot {slot} is empty"
+        _, goal = self.waiting.pop(slot - 2)
+        return f"dropped slot {slot} ({goal})"
+
+    async def _start_next(self) -> str:
+        source, goal = self.waiting.pop(0)
+        started = await self._start(source, goal)
+        if not self.waiting:
+            self.wake("the last queued script started: queue what comes next")
+        return f"slot 1 now: {goal} ({started})"
+
+    async def _start(self, source: str, goal: str) -> str:
+        """Start a script in slot 1, replacing the one running."""
         how = command(self.limits)  # refuse before stopping anything when scripts can't run here
         replaced = ""
         if old := self.script:
             replaced = f"stopped the previous script at line {old.line}; "
-            await self._stop_script(old, "a new script replaced it", cancel_action=not finish_current, wait=not finish_current)
-        proc = await asyncio.create_subprocess_exec(*how, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                    env={}, cwd="/", limit=MAX_MESSAGE)
-        script = self.script = Script(source, goal, proc, started=time.monotonic())
-        self.emit(Step("script", "started"))
-        proc.stdin.write(json.dumps({"source": source}).encode() + b"\n")
-        script.task = asyncio.create_task(self._serve(script))
+            await self._stop_script(old, "a new script replaced it")
+        if self.ctx.game is not None:  # each script starts with the default guard: near, when armed
+            self.ctx.game.guard = combat.Guard(tactics=combat.Tactics(self.ctx.decide) if self.ctx.decide else None)
+        self.script = await self._spawn(how, source, goal)
+        self.emit(Step("script", "started", True, {"goal": goal, "source": source}))
         self._changed.set()
         return replaced + "started"
+
+    async def _spawn(self, how: list[str], source: str, goal: str, query: bool = False) -> Script:
+        proc = await asyncio.create_subprocess_exec(*how, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                                                    env={}, cwd="/", limit=MAX_MESSAGE)
+        script = Script(source, goal, proc, started=time.monotonic(), query=query)
+        proc.stdin.write(json.dumps({"source": source, "api": API}).encode() + b"\n")
+        script.task = asyncio.create_task(self._serve(script))
+        return script
+
+    async def query(self, source: str, timeout: float = 90) -> str:
+        """Run a read-only script beside the running one, without disturbing it, and return what it printed."""
+        vet(source)
+        script = await self._spawn(command(self.limits), source, "a query", query=True)
+        try:
+            await asyncio.wait_for(script.done.wait(), timeout)
+        except asyncio.TimeoutError:
+            script.task.cancel()
+            await asyncio.wait({script.task})
+            script.outcome = ("killed", f"it took over {timeout:.0f}s")
+        how, *rest = script.outcome or ("killed", "it ended without saying how")
+        printed = "\n".join(script.output) or "(it printed nothing)"
+        if how == "error":
+            e = rest[0]
+            return f"{printed}\n{e['error']}: {e.get('message', '')} at line {e.get('line')}: {e.get('source_line', '')}"
+        if how == "killed":
+            return f"{printed}\nthe query ended: {rest[0]}"
+        return printed
 
     async def halt(self, why: str) -> None:
         """Stop the script and the running action, and the idle work."""
@@ -375,29 +417,24 @@ class Runner:
 
     async def interrupt(self, why: str) -> None:
         if self.script:
-            await self._stop_script(self.script, why, cancel_action=True, wait=True)
+            await self._stop_script(self.script, why)
 
     def hear(self, entry: dict) -> None:
         if entry.get("kind") in HEARD and entry.get("text"):
             self._heard.append(f"{entry['kind']}: {entry['text'][:200]}")
 
     def describe(self) -> str:
-        lines = []
-        if self.script:
-            lines.append(f"script running ({self.script.goal}), at line {self.script.line}")
-        if self.current:
-            lines.append(f"running {self.current.label} (started {time.monotonic() - self.current.started:.0f}s ago)")
-        return "\n".join(lines) or "no script: the farmer is idle"
+        """The script slots: what runs (and its action), and what waits."""
+        lines = [f"slot 1: {self.script.goal}, at line {self.script.line}" + (f", running {self.current.label} for {time.monotonic() - self.current.started:.0f}s" if self.current else "")
+                 if self.script else "slot 1: empty (the farmer is idle)"]
+        lines += [f"slot {i + 2}: {goal}" for i, (_, goal) in enumerate(self.waiting)]
+        return "\n".join(lines)
 
     def take(self) -> tuple[list[str], list[Image], list[str]]:
-        """The trace since the last call, its images, and why the planner was woken."""
+        """The trace since the last call, its images, and why the agent was woken."""
         taken = self._trace, self._images, list(dict.fromkeys(self._why))
         self._trace, self._images, self._why, self.printed = [], [], [], []
         return taken
-
-    def wake(self, why: str) -> None:
-        """Wake the planner for something outside the script (the player's message)."""
-        self._wake(why)
 
     # --- serving a script ----------------------------------------------------------------------------------
 
@@ -420,12 +457,14 @@ class Runner:
                     await proc.wait()
                     raise Kill(death(proc.returncode, await proc.stderr.read(MAX_MESSAGE)))
                 try:
-                    message = json.loads(raw)
+                    message = json.loads(raw, object_hook=record)
                 except (ValueError, RecursionError):
                     message = None
                 if not isinstance(message, dict):
                     raise Kill("it sent something which isn't a message")
                 script.line = line_of(message, script.line)
+                if set(message) == {"line"}:  # the script moved on to another line (pure Python too)
+                    continue
                 if "log" in message:
                     script.logged += 1
                     if script.logged > MAX_LOGS:
@@ -433,13 +472,14 @@ class Runner:
                     script.chars += len(logged := text_of(message["log"], MAX_LOG_TEXT))
                     if script.chars > MAX_LOG_CHARS:
                         raise Kill(f"it logged over {MAX_LOG_CHARS} characters")
-                    self._note("printed: " + logged, "log")
-                    self.printed.append(logged)
-                    self._queued = True
-                    self._wake_for_messages()
+                    if script.query:  # a query's prints are its answer, not messages
+                        script.output.append(logged)
+                    else:
+                        self._note("printed: " + logged, "log")
+                        self.printed.append((time.monotonic(), logged))
+                        self._queued = True
+                        self._wake_for_messages()
                 elif "call" in message:
-                    if script.calls > MAX_CALLS + 20:  # it keeps calling past its budget
-                        raise Kill(f"it went on calling after {MAX_CALLS} calls")
                     try:
                         reply = await self._answer(script, message)
                     except (Stopped, asyncio.CancelledError):
@@ -454,9 +494,7 @@ class Runner:
                     except asyncio.TimeoutError:  # it stopped reading its replies
                         raise Kill("it stopped reading replies") from None
                 else:
-                    if "ask" in message:
-                        script.outcome = ("ask", text_of(message["ask"]))
-                    elif "error" in message:
+                    if "error" in message:
                         script.outcome = ("error", {k: text_of(message.get(k)) for k in ("error", "message", "source_line")} | {"line": script.line})
                     else:
                         script.outcome = ("done",)
@@ -472,82 +510,84 @@ class Runner:
             self._ended(script)
 
     async def _answer(self, script: Script, message: dict) -> dict:
-        """Carry out one SDK call; a Surprise or TypeError becomes a raise in the script."""
-        name, args, kwargs = message["call"], message.get("args") or [], message.get("kwargs") or {}
-        script.calls += 1
+        """Carry out one call; a Surprise or TypeError becomes a raise in the script."""
         try:
-            if script.calls > MAX_CALLS:
-                raise Surprise(f"budget: the script made over {MAX_CALLS} calls")
-            return {"value": await self._sdk(script, name, args, kwargs)}
+            return {"value": await self._sdk(script, message)}
         except Surprise as ex:
             return {"raise": type(ex).__name__, "args": list(ex.args)}
         except TypeError as ex:
             return {"raise": "TypeError", "args": [str(ex)]}
 
-    async def _sdk(self, script: Script, name: str, args: list, kwargs: dict) -> Any:
-        g = self.ctx.game
+    async def _sdk(self, script: Script, message: dict) -> Any:
+        name, args, kwargs = message["call"], message.get("args") or [], message.get("kwargs") or {}
         if script.stopped:  # a stale script gets nothing more done
             raise Stopped(script.stopped)
+        kind, cls, fn = api.lookup(name)
+        if script.query and (kind in ("action", "setting") or name == "Screen.shot"):
+            raise TypeError(f"a query only looks: {name} isn't allowed; use run to act" + (", or the screenshot tool" if name == "Screen.shot" else ""))
         if name == "answer" and args and isinstance(args[0], str):
-            args = [await self._pick(args[0], await g.read("menu.choices") or []), *args[1:]]
-        if name in ACTIONS:
-            return await self._act(script, name, plain(args), plain(kwargs))
-        if name in FACTS:
-            call = inspect.signature(FACTS[name]).bind(self.ctx, *plain(args), **plain(kwargs))  # a TypeError for the script
-            try:
-                value = await FACTS[name](*call.args, **call.kwargs)
-            except (ActionError, BridgeError) as ex:
-                raise failure(str(ex)) from None
-            if isinstance(value, Image):  # for the planner, who sees it when woken
-                self._images.append(value)
-                self._note("screenshot taken")
-                return "(the planner sees the screenshot when next woken)"
-            return value
-        match name, args, kwargs:
-            case "shop_stock", [], {}:
-                return [thing(s) for s in await self._stock(script)]
-            case "backpack", [part], {}:
-                items = [thing(i) for i in await g.inventory()] if part in ("items", "food", "fish") else []
-                free = await g.read("player.free_slots") if part in ("free", "full") else 0
-                return {"items": items, "food": [i for i in items if i.energy > 0], "fish": [i for i in items if i.category in ("Fish", "-4")],
-                        "free": free, "full": free == 0}[part]
-            case "check", [str(situation)], {}:
-                i, sure = await self.judge.which([situation])
-                if sure < SURE:
-                    raise Unsure(situation, sure)
-                self._note(f"check {situation!r}: {'yes' if i == 0 else 'no'} ({sure:.2f})", "judge")
-                return i == 0
-            case "pick", [str(description), list(options)], {}:
-                return await self._pick(description, options)
-        raise TypeError(f"{name}() was called the wrong way: {args} {kwargs}")
+            args = [await self._pick(args[0], await self.ctx.game.read("menu.choices") or []), *args[1:]]
+        me = cls() if cls.live else cls(message.get("self"))
+        call = inspect.signature(fn).bind(me, self.ctx, *args, **kwargs)  # a TypeError for the script
+        if kind == "action":
+            return await self._act(script, name, fn, call)
+        given = list(call.arguments.values())[2:]
+        if kind == "judge" and name == "check":
+            return await self._check(*given)
+        if kind == "judge":
+            description, options = given
+            return options[await self._pick(description, options)]
+        try:
+            value = await fn(*call.args, **call.kwargs)
+        except (ActionError, BridgeError) as ex:
+            raise failure(str(ex)) from None
+        if kind == "setting":
+            self._note(value, "safety")
+        if isinstance(value, Image):  # for the agent, who sees it when woken
+            self._images.append(value)
+            self._note("screenshot taken")
+            return "(the agent sees the screenshot when next woken)"
+        return value
 
-    async def _pick(self, description: str, options: list) -> int:
+    async def _check(self, situation: Any) -> bool:
+        if not isinstance(situation, str):
+            raise TypeError(f"check takes a situation as text, not {situation!r}")
+        i, sure = await self._which([situation])
+        if sure < SURE:
+            raise Unsure(situation, sure)
+        self._note(f"check {situation!r}: {'yes' if i == 0 else 'no'} ({sure:.2f})", "judge")
+        return i == 0
+
+    async def _pick(self, description: Any, options: Any) -> int:
         """The index of the option the judge picks; raises Unsure."""
+        if not (isinstance(description, str) and isinstance(options, list)):
+            raise TypeError("pick takes a description (text) and a list of options")
         if not options:
             raise Unsure(description, 0.0)
-        i, sure = await self.judge.which([described(o) for o in options], {"choosing": description})
+        i, sure = await self._which([described(o) for o in options], {"choosing": description})
         if i is None or sure < SURE:
             raise Unsure(description, sure)
         self._note(f"pick {description!r}: {described(options[i])} ({sure:.2f})", "judge")
         return i
 
-    async def _stop_script(self, script: Script, why: str, cancel_action: bool, wait: bool) -> None:
-        """Stop a script: its process is killed, and its running action cancelled unless it should finish."""
+    async def _stop_script(self, script: Script, why: str) -> None:
+        """Stop a script: its running action is cancelled, and its process killed."""
         script.stop(why)
         if self.script is script:
             self.script = None
-        running = self.current and self._owner is script and self._job and not self._job.done()
-        if running and cancel_action:
+        if self.current and self._owner is script and self._job and not self._job.done():
             self._cancel = Stopped(why)
             self._job.cancel()  # the action winds down, then the process is killed
-        elif not running and script.task:
+        elif script.task:
             script.task.cancel()
-        if wait and script.task:
+        if script.task:
             await asyncio.wait({script.task}, timeout=5)
 
     def _ended(self, script: Script) -> None:
-        """A script's process is gone: tell the planner how it ended, unless it was stopped on purpose."""
+        """A script's process is gone: tell the agent how it ended, unless it was stopped on purpose."""
         script.done.set()
+        if script.query:  # its caller reads how it ended
+            return
         self.emit(Step("script", "ended"))
         if self.script is script:
             self.script = None
@@ -556,18 +596,21 @@ class Runner:
             self._message_timer.cancel()
             self._message_timer = None
         how, *rest = script.outcome or ("killed", "it ended without saying how")
+        if how == "done" and self.waiting:  # the next one goes on at once: the agent queued it
+            asyncio.get_running_loop().create_task(self._start_next())
+            return
+        if how in ("error", "killed") and self.waiting:  # what's queued may have depended on this one: you decide again
+            self._why.append(f"the queue was cleared: {'; '.join(goal for _, goal in self.waiting)}")
+            self.waiting = []
         if how == "done":
-            self._wake("the script ended")
-        elif how == "ask":
-            self._note(f"the script asks: {rest[0]}")
-            self._wake(f"the script asks: {rest[0]}")
+            self.wake("the script ended")
         elif how == "error":
             e = rest[0]
             self._note(f"{e['error']}: {e.get('message', '')}\n  at line {e.get('line')}: {e.get('source_line', '')}", ok=False)
-            self._wake(f"the script raised {e['error']} at line {e.get('line')}")
+            self.wake(f"the script raised {e['error']} at line {e.get('line')}")
         elif how == "killed":
             self._note(f"the script was ended at line {script.line}: {rest[0]}", ok=False)
-            self._wake(rest[0] if rest[0].startswith("the script") else f"the script was ended: {rest[0]}")
+            self.wake(rest[0] if rest[0].startswith("the script") else f"the script was ended: {rest[0]}")
         else:
             self._note(f"the script stopped at line {script.line}: {rest[0]}")
             if self.error:
@@ -575,15 +618,29 @@ class Runner:
 
     # --- actions -------------------------------------------------------------------------------------------
 
-    def _context(self) -> dict:
-        return {"goal": self.script.goal if self.script else "", "last_step": self._last[0], "its_result": self._last[1][:600], "recent_events": list(self._heard)}
+    async def _which(self, options: list[str], extra: dict | None = None) -> tuple[int | None, float]:
+        """The judge: the index of the option which holds (None: none of them), and how sure it is, from the facts and what just happened."""
+        if not self.ctx.decide:
+            return None, 0.0
+        criteria = {f"case{i}": c for i, c in enumerate(options)} | {"none": NONE}
+        try:
+            now = await self.ctx.game.read(FACTS_READ)
+            known = facts(now["time"], now)
+        except (BridgeError, KeyError, TypeError) as ex:
+            known = {"status": f"unknown ({ex})"}
+        context = {"goal": self.script.goal if self.script else "", "last_step": self._last[0], "its_result": self._last[1][:600], "recent_events": list(self._heard)}
+        try:
+            key, sure = await self.ctx.decide({**context, **known, **(extra or {})}, criteria)
+        except Exception:
+            return None, 0.0
+        return (int(key[4:]) if key and key.startswith("case") else None), sure
 
     def _note(self, line: str, kind: str = "info", ok: bool = True) -> None:
         self._trace.append(line)
         self.emit(Step(kind, line, ok))
 
     def _wake_for_messages(self) -> None:
-        """A script's messages wake the planner, which reads them all: after a moment (so a burst comes as one, and a script
+        """A script's messages wake the agent, which reads them all: after a moment (so a burst comes as one, and a script
         which ends meanwhile wakes it just once), and not more often than WAKE_EVERY."""
         if self._queued and not self._message_timer:
             wait = max(GATHER, self._woken_for_messages + WAKE_EVERY - time.monotonic())
@@ -593,9 +650,9 @@ class Runner:
         self._message_timer = None
         if self.script and self._queued:
             self._woken_for_messages, self._queued = time.monotonic(), False
-            self._wake("the script sent messages (it's still running)")
+            self.wake("the script sent messages (it's still running)")
 
-    def _wake(self, why: str) -> None:
+    def wake(self, why: str) -> None:
         self._why.append(why)
         self.emit(Step("wake", why))
         self.on_wake()
@@ -607,10 +664,10 @@ class Runner:
             else:
                 await self.script.done.wait()
 
-    async def _act(self, script: Script, name: str, args: list, kwargs: dict) -> Any:
+    async def _act(self, script: Script, name: str, fn: Callable, call: inspect.BoundArguments) -> Any:
         """Run one action for a script, keeping watch for safety meanwhile. Returns its result; raises a Surprise, TypeError, or Stopped."""
-        call = inspect.signature(ACTIONS[name]).bind(self.ctx, *args, **kwargs)  # a TypeError for the script
-        given = dict(list(call.arguments.items())[1:])
+        me = call.arguments["self"]
+        given = ({"of": me.ref["name"]} if "name" in me.ref else {}) | dict(list(call.arguments.items())[2:])
         async with self._lock:
             if script.stopped:
                 raise Stopped(script.stopped)
@@ -622,7 +679,7 @@ class Runner:
             self._owner = script
             self.emit(Step("call", job.label, data={"name": name, "args": given, "line": script.line}))
             self._cancel = None
-            self._job = asyncio.create_task(self._perform(name, call))
+            self._job = asyncio.create_task(self._perform(name, fn, call, given))
             try:
                 while not self._job.done():
                     await asyncio.wait({self._job}, timeout=self.poll)
@@ -630,13 +687,16 @@ class Runner:
                         break
                     if self._overtime(script):
                         self._cancel = Stopped(script.stopped)
-                    elif hit := await self._danger(name, given):
-                        self._cancel = hit
+                    else:
+                        await self._sample(job)
+                        if hit := await self._danger(name, given) or await self._stuck(job):
+                            self._cancel = hit
                     if self._cancel:
                         self._job.cancel()
                         await asyncio.wait({self._job})
             except BaseException:
-                self._job.cancel()
+                self._job.cancel()  # and let it wind down, so it never runs beside the next action
+                await asyncio.wait({self._job}, timeout=5)
                 self.current = self._owner = None
                 raise
             self.current = self._owner = None
@@ -646,7 +706,7 @@ class Runner:
                 self._record(job, Outcome(f"stopped partway: {type(raised).__name__}: {raised}", ok=False))
                 raise raised
             if isinstance(ex := self._job.exception(), HumanControl):
-                self._wake("the player took control")  # the planner pauses until it's given back
+                self.wake("the player took control")  # the agent pauses until it's given back
                 raise script.stop("the player took control")
             if isinstance(ex, Disconnected):
                 self.error = ex
@@ -656,8 +716,10 @@ class Runner:
             else:
                 outcome, value, raised = self._job.result()
             self._record(job, outcome)
+            if not outcome.ok and (stuck := await self._stuck(job, failed=True)):
+                raised = stuck  # failing again and again: say so, rather than the failure alone
             if self.ctx.finished:
-                self._wake("the day ended")
+                self.wake("the day ended")
                 raise script.stop("the day ended")
             if raised:
                 raise raised
@@ -665,14 +727,16 @@ class Runner:
                 raise Question(str(value["needs_choice"]), [str(p) for p in value.get("professions", [])])
             return value
 
-    async def _perform(self, name: str, call: inspect.BoundArguments) -> tuple[Outcome, Any, BaseException | None]:
-        """Do the action. Returns what the planner reads of it, what the script gets, and what the script should raise instead."""
+    async def _perform(self, name: str, fn: Callable, call: inspect.BoundArguments, given: dict) -> tuple[Outcome, Any, BaseException | None]:
+        """Do the action. Returns what the agent reads of it, what the script gets, and what the script should raise instead."""
         g = self.ctx.game
         if self.ctx.before_action:
             await self.ctx.before_action()
         value, raised = None, None
         try:
-            value = await ACTIONS[name](*call.args, **call.kwargs)
+            if not api.recovers(name, given):
+                await g.guard.watch(g, hunt=True)  # with guard("all"), the floor is cleared between actions
+            value = await fn(*call.args, **call.kwargs)
             text = render(value) if value not in (None, {}, []) else "done"
         except (HumanControl, Disconnected):
             raise
@@ -683,7 +747,7 @@ class Runner:
         except TypeError as ex:  # the call's arguments were the wrong shape
             text, raised = f"ERROR: TypeError: {ex}", TypeError(str(ex))
         except Exception as ex:  # a bug in a skill shouldn't end the day
-            logging.exception("action %s failed with %s", name, call.arguments)
+            logging.exception("action %s failed with %s", name, given)
             reason = f"this action failed unexpectedly ({type(ex).__name__}: {ex}); try another way"
             text, raised = f"ERROR: {reason}", failure(reason)
         parts = [text]
@@ -707,33 +771,70 @@ class Runner:
 
     def _record(self, job: Job, outcome: Outcome) -> None:
         data = {"name": job.name, "args": job.args, **outcome.shown} if outcome.shown else {}
-        # the planner reads the same lines the view draws (display.action_lines), as plain text and uncut
+        # the agent reads the same lines the view draws (display.action_lines), as plain text and uncut
         told = "\n".join(line.plain for line in action_lines(data, outcome.ok, full=True)) if data else f"{job.label}: {outcome.text}"
         self._last = (job.label, told)
+        self._finished.append(time.monotonic())
+        self._done.append((self._samples[-1]["clock"] if self._samples else "", job.label, ("ok" if outcome.ok else "failed: ") + (told.split("\n")[0][len(job.label) + 2:][:150] if not outcome.ok else "")))
         self._trace.append(told)
         self.emit(Step("result", f"{job}: {outcome.text}", outcome.ok, data))
 
-    async def _stock(self, script: Script) -> list[dict]:
-        async with self._lock:
-            if script.stopped:  # it may have been stopped while it waited for the lock
-                raise Stopped(script.stopped)
-            try:
-                await self.ctx.game.open_shop()
-            except ActionError as ex:
-                raise failure(str(ex)) from None
-            return await self.ctx.game.shop_stock()
+    async def _sample(self, job: Job) -> None:
+        """Every SAMPLE seconds while an action runs: where the farmer is, for the stuck check."""
+        if time.monotonic() - self._sampled < SAMPLE:
+            return
+        self._sampled = time.monotonic()
+        try:
+            at = await self.ctx.game.read({"tile": "player.tile", "place": "location.name", "clock": "time.text", "energy": "player.energy", "money": "player.money",
+                                           "busy": "state.cutscene or state.menu"})
+        except BridgeError:
+            return
+        if at.pop("busy"):  # a cutscene or a dialogue: standing still then is no sign of being stuck, so the check waits
+            self._asked = self._sampled
+            return
+        self._samples.append({**at, "tile": tuple(at["tile"]), "energy": int(at["energy"]), "action": job.label, "at": self._sampled})
+
+    async def _stuck(self, job: Job, failed: bool = False) -> Stuck | None:
+        """The judge's always-on check, for what the other checks miss: is the farmer stuck, failing again and again, or going round
+        in a loop? Asked every STUCK_EVERY seconds while an action runs (once it has run STUCK_AFTER, or a few actions were done), and
+        after a failed action once failures repeat (3 of the last 4 actions; one failure is just a failure, with its own reason).
+        It sees the recent actions and positions with their times, and ready-made counts (it compares well but can't do arithmetic)."""
+        now = time.monotonic()
+        busy = now - job.started >= STUCK_AFTER or len(self._finished) == 4 and now - self._finished[0] <= 6 * STUCK_AFTER  # a long action, or a run of short ones (a loop)
+        if failed and sum(how.startswith("failed") for _, _, how in list(self._done)[-4:]) < 3:
+            return None
+        if not failed and (not busy or now - self._asked < STUCK_EVERY):
+            return None
+        self._asked = now
+        seen = {"running": f"{job.label}, for {now - job.started:.0f}s" if not failed else "nothing (the last action failed)",
+                **stuck_facts(list(self._done), list(self._samples), now)}
+        if not failed and seen["new_tiles_last_20s"] >= 3:  # getting somewhere new is progress; a loop comes back to the same tiles
+            self._strikes = 0
+            return None
+        i, sure = await self._which(STUCK, seen)
+        stuck = i == 1 and sure >= STUCK_SURE
+        self._strikes = self._strikes + 1 if stuck else 0
+        if not stuck or (not failed and self._strikes < 2):
+            return None
+        self._strikes = 0
+        self._trace.append(f"stuck check: stuck ({sure:.2f})")
+        self.emit(Step("judge", f"stuck check: stuck ({sure:.2f})", True, {"saw": seen}))  # what it judged by, for the transcript
+        if failed:
+            _, label, how = self._done[-1]
+            return Stuck(f"failing again and again; the last: {label}: {how.removeprefix('failed: ')}")
+        return Stuck(f"{job.label} isn't getting anywhere")
 
     async def _danger(self, name: str, args: dict) -> Surprise | None:
         """Low health, low energy, or the time to head home, each raised once until it clears. Actions which cure it may run."""
-        if recovers(name, args):
+        if api.recovers(name, args):
             return None
         try:
-            s = await self.ctx.game.read({"health": "player.health", "maxh": "player.max_health", "energy": "player.energy", "clock": "time.clock", "place": "location.name"})
+            s = await self.ctx.game.read(STATUS)
         except BridgeError:
             return None
         found: dict[str, Surprise] = {}
-        if s["health"] < LOW_HEALTH * s["maxh"]:
-            found["health"] = LowHealth(f"health is low ({s['health']}/{s['maxh']})")
+        if s["hp"] < LOW_HEALTH * s["maxh"]:
+            found["health"] = LowHealth(f"health is low ({s['hp']}/{s['maxh']})")
         if s["energy"] < LOW_ENERGY:
             found["energy"] = LowEnergy(f"energy is low ({int(s['energy'])})")
         left = until_2am(s["clock"])
@@ -748,13 +849,13 @@ class Runner:
 
     async def _walk_home(self, s: dict) -> int | None:
         """Game minutes to walk home, estimated again when the location changes or every 30 game minutes."""
-        estimate = getattr(self.ctx.game, "minutes_home", None)
+        estimate = getattr(self.ctx.game, "minutes", None)
         if not estimate:
             return None
         h = self._home
         if h.get("place") != s["place"] or minutes(s["clock"]) - h.get("at", -999) >= 30:
             try:
-                self._home = h = {"place": s["place"], "at": minutes(s["clock"]), "walk": await estimate()}
+                self._home = h = {"place": s["place"], "at": minutes(s["clock"]), "walk": await estimate("home")}
             except (BridgeError, ActionError):
                 return h.get("walk")
         return h["walk"]

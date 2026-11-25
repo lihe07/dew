@@ -31,6 +31,10 @@ def write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def dump(facts: dict[str, str]) -> str:
+    return json.dumps(dict(sorted(facts.items())), indent=1, ensure_ascii=False)
+
+
 def key_error(key: Any) -> str | None:
     if not isinstance(key, str) or not key.strip():
         return "a key is a short dotted name, like shop.pierre.hours"
@@ -51,12 +55,9 @@ class Memory:
             data = json.loads(path.read_text() or "{}")
             self.facts = {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
-    def __len__(self) -> int:
-        return len(self.facts)
-
     def save(self) -> None:
         if self.path:
-            write_atomic(self.path, json.dumps(dict(sorted(self.facts.items())), indent=1, ensure_ascii=False) + "\n")
+            write_atomic(self.path, dump(self.facts) + "\n")
 
     def remember(self, key: Any, value: Any) -> tuple[bool, str]:
         if error := key_error(key):
@@ -172,7 +173,7 @@ def compare(old: dict[str, str], new: dict[str, str]) -> Change:
 async def consolidate(memory: Memory, date: str, diary: str, client: Any, model: str) -> Change:
     """Ask the model for the whole new memory; apply it (keeping a backup) only if it passes the checks. Raises Rejected otherwise."""
     old = dict(memory.facts)
-    prompt = CONSOLIDATE.format(date=date, max_value=MAX_VALUE, max_keys=MAX_KEYS, memory=json.dumps(dict(sorted(old.items())), indent=1, ensure_ascii=False), diary=diary)
+    prompt = CONSOLIDATE.format(date=date, max_value=MAX_VALUE, max_keys=MAX_KEYS, memory=dump(old), diary=diary)
     response = await client.messages.create(model=model, max_tokens=16_000, thinking={"type": "disabled"}, messages=[{"role": "user", "content": prompt}])
     reply = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
     if not reply.strip():
@@ -180,7 +181,7 @@ async def consolidate(memory: Memory, date: str, diary: str, client: Any, model:
     new = parse(reply, old)
     change = compare(old, new)
     if memory.path:
-        write_atomic(memory.path.with_name(memory.path.name + ".bak"), json.dumps(dict(sorted(old.items())), indent=1, ensure_ascii=False) + "\n")
+        write_atomic(memory.path.with_name(memory.path.name + ".bak"), dump(old) + "\n")
     memory.facts = new
     memory.save()
     return change

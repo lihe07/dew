@@ -1,9 +1,8 @@
-"""The planner's web tool: a small research subagent (hy4-flash by default) which searches and reads pages through TinyFish,
-then answers in a few sentences, so the planner's own context never fills with web pages."""
+"""The agent's web tool: a small research subagent (hy4-flash by default) which searches and reads pages through TinyFish,
+then answers in a few sentences, so the agent's own context never fills with web pages."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -34,24 +33,23 @@ class Research:
         self.client, self.model = client, model
         self.http = httpx.AsyncClient(headers={"X-API-Key": tinyfish_key}, timeout=timeout)
 
-    async def answer(self, question: str) -> tuple[str, list[str]]:
-        """The answer, and what the subagent did (for display)."""
+    async def answer(self, question: str) -> str:
         messages: list[dict] = [{"role": "user", "content": PROMPT.format(question=question)}]
-        did: list[str] = []
+        used = 0  # tool calls
         for _ in range(MAX_STEPS):
-            last = len(did) >= MAX_STEPS - 1
+            last = used >= MAX_STEPS - 1
             response = await self.client.messages.create(model=self.model, max_tokens=1200, messages=messages, thinking={"type": "disabled"},
                                                           **({} if last else {"tools": TOOLS}))
             calls = [b for b in response.content if b.type == "tool_use"]
             if not calls:
-                return "\n".join(b.text for b in response.content if b.type == "text").strip() or "nothing found", did
+                return "\n".join(b.text for b in response.content if b.type == "text").strip() or "nothing found"
             messages.append({"role": "assistant", "content": [b.model_dump() for b in response.content if b.type in ("text", "tool_use")]})
             results = []
             for call in calls:
-                did.append(f"{call.name} {json.dumps(call.input, ensure_ascii=False)[:120]}")
+                used += 1
                 results.append({"type": "tool_result", "tool_use_id": call.id, "content": await self._tool(call.name, call.input)})
             messages.append({"role": "user", "content": results})
-        return "no answer in time", did
+        return "no answer in time"
 
     async def _tool(self, name: str, args: dict) -> str:
         try:

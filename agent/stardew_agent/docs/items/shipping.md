@@ -1,8 +1,8 @@
 # Shipping
-ship puts items into the farm's shipping bin, from anywhere, to be paid overnight.
+item.ship() puts items into the farm's shipping bin, from anywhere, to be paid overnight.
 
-## ship
-`ship(item, count=None)`
+## Item.ship
+`item.ship(count=None)`, like `backpack["Parsnip"].ship(10)`
 
 Walks to the farm's shipping bin (from wherever you are: it travels to the Farm first), opens it, puts in the whole stack or `count` of it, and closes it. The money comes overnight, at the item's sell price (`.price`).
 
@@ -16,11 +16,10 @@ Raises:
 ```python
 for f in backpack.fish:
     if f.price < 75:
-        ship(f)
+        f.ship()
 ```
 
 ## Gotchas
-- Each `ship` walks to the bin, so from town or the beach the first one costs a long walk; ship everything in one go when you're home.
+- Each `.ship()` walks to the bin, so from town or the beach the first one costs a long walk; ship everything in one go when you're home.
 - Shipping is the only way to sell after the shops close, and its prices are the same as selling.
 - What was earned shows in the night's notes (`shipping earned 820g`) and in the morning report.
-- With the bin's menu open (opened with `screen("interact", tiles=[[x, y]])` on the bin), `put("Parsnip")` ships that stack too (`docs("items/chests#put")`).

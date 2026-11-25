@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import vision
 from .memory import Memory, write_atomic
 
 SEASONS = ["spring", "summer", "fall", "winter"]
@@ -65,6 +66,7 @@ class SaveData:
     diary_file = property(lambda self: self.dir / "diary.jsonl")
     days_dir = property(lambda self: self.dir / "days")
     context_file = property(lambda self: self.dir / "context.json")
+    planner_file = property(lambda self: self.dir / "planner.json")  # the planner's conversation, goals and plan, kept across days
     screenshots = property(lambda self: self.dir / "screenshots")
 
     def prepare(self, old_root: Path = OLD_DATA) -> list[str]:
@@ -86,17 +88,19 @@ class SaveData:
     # --- the days' transcripts ------------------------------------------------------------------------------
 
     def record(self, kind: str, text: str, data: dict | None = None, ok: bool = True) -> None:
-        """Append a step shown to the day's transcript."""
-        line = json.dumps({"kind": kind, "text": text, "ok": ok, "data": clean(data or {})}, default=str, ensure_ascii=False)
-        if kind == "day":
+        """Keep a step shown for the day's transcript. Nothing reaches disk until the day ends (end_day), as with the game's own save."""
+        if kind == "day" and day_key(text) != self.today:
             self.today = day_key(text)
-        if self.today is None:
-            self._pending.append(line)
-            return
-        self.days_dir.mkdir(parents=True, exist_ok=True)
-        with (self.days_dir / f"{self.today}.jsonl").open("a") as f:
-            f.write("".join(l + "\n" for l in [*self._pending, line]))
-        self._pending = []
+        self._pending.append(json.dumps({"kind": kind, "text": text, "ok": ok, "data": clean(data or {})}, default=str, ensure_ascii=False))
+
+    def end_day(self) -> None:
+        """The day is over: write its transcript and screenshots."""
+        if self.today and self._pending:
+            self.days_dir.mkdir(parents=True, exist_ok=True)
+            with (self.days_dir / f"{self.today}.jsonl").open("a") as f:
+                f.write("".join(l + "\n" for l in self._pending))
+            self._pending = []
+        vision.write_kept()
 
     def load_days(self, count: int = 7) -> list[list[dict]]:
         """The last few days' steps, oldest day first."""
@@ -114,8 +118,8 @@ class SaveData:
             days.append(steps)
         return days
 
-    # --- the planner's context ------------------------------------------------------------------------------
+    # --- the agent's context ------------------------------------------------------------------------------
 
     def save_context(self, date: str, messages: list[dict], turns: int = 0) -> None:
-        """The finished day's conversation with the planner, kept as a record (a new day always starts fresh)."""
+        """The finished day's conversation with the agent, kept as a record (a new day always starts fresh)."""
         write_atomic(self.context_file, json.dumps({"date": date, "turns": turns, "messages": clean(messages)}, default=str, ensure_ascii=False))

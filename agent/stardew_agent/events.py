@@ -55,6 +55,16 @@ class Events:
             else:
                 await self.step(240, {"menu": "state.menu", "end": "not state.cutscene"})
 
+    async def pass_event(self) -> None:
+        """Skip a cutscene when it can be skipped and asks nothing, telling the journal what it would have shown; else play it through."""
+        try:
+            lines = await self.skip_event()
+        except ActionError:
+            return await self.play_event()
+        for line in lines:
+            for listener in self.d.on_journal:
+                listener({"kind": "event", "text": line})
+
     async def skip_event(self) -> list[str]:
         """Skip a cutscene. Returns the rest of its script, since none of it will be shown."""
         if not await self.read("state.cutscene"):
@@ -62,10 +72,10 @@ class Events:
         await self.step(240, {"ok": "event.skippable", "menu": "state.menu"})
         script = await self.read({"commands": "event.commands", "index": "event.index", "skippable": "event.skippable", "actors": {"from": "event.actor_rows", "select": ["internal", "name"]}})
         if not script["skippable"]:
-            raise ActionError("this cutscene can't be skipped; use dialogue to play it")
+            raise ActionError("this cutscene can't be skipped")
         remaining = script["commands"][script["index"]:]
         if any(c.lower().startswith(("question", "quickquestion")) for c in remaining):
-            raise ActionError("this cutscene asks you a question, so it shouldn't be skipped; use dialogue to play it")
+            raise ActionError("this cutscene asks you a question, so it shouldn't be skipped")
         lines = list(filter(None, (script_line(c, {a["internal"]: a["name"] for a in script["actors"]}) for c in remaining)))
         for _ in range(5):
             if await self.read("state.menu"):

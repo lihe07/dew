@@ -10,3 +10,4 @@ stardew-data/
 .pytest_cache/
 .ruff_cache/
 *.pyc
+stardew.toml

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from .common import ActionError, Interrupted
-from .places import POOL_WATER
+
+POOL_WATER = [(15, 15), (10, 14), (18, 16), (12, 13)]  # inside the spa's pool; stepping in starts swimming
 
 
 class Rest:
@@ -13,11 +14,11 @@ class Rest:
         """Get into the spa's pool and stay until energy is full (or the clock reaches until, like 1600)."""
         await self.ready()
         if await self.read("location.name") != "BathHouse_Pool":
-            await self.travel("BathHouse_Pool")
+            await self.go("BathHouse_Pool")
         if not await self.read("player.swimming"):
             for tile in POOL_WATER:
                 try:
-                    await self.walk_to(tile)
+                    await self.go(tile)
                 except ActionError:
                     continue
                 if await self.read("player.swimming"):
@@ -40,26 +41,19 @@ class Rest:
         return {"energy": f"{int(before['energy'])} -> {int(after['energy'])}/{after['max']}", "from": before["clock"], "to": after["clock"]}
 
     async def sleep(self) -> dict:
-        state = await self.read("state")
-        day = await self.read("time.total")
-        if not state.get("night"):
+        """Go to bed. The night's screens are left for the next day (finish_night)."""
+        if not await self.read("state.night"):
             await self.ready()
             home, bed = await self.read(["player.home", "player.bed_tile"])
-            await self.travel(home)
+            await self.go(home)
             if not bed:
                 raise ActionError("there's no bed at home")
             for _ in range(3):
                 if await self.here() == tuple(bed):
                     # the prompt only appears when stepping onto the bed
-                    await self.goto([(bed[0] - 2, bed[1]), (bed[0] - 2, bed[1] + 1), (bed[0] - 3, bed[1])], what="beside the bed")
+                    await self.go([(bed[0] - 2, bed[1]), (bed[0] - 2, bed[1] + 1), (bed[0] - 3, bed[1])], what="beside the bed")
                 try:
-                    try:
-                        await self.goto([bed], what="the bed")
-                    except ActionError as ex:
-                        if isinstance(ex, Interrupted) or "in the way" not in str(ex):
-                            raise
-                        # pets like to lie on the bed, and the farmer can walk past them there
-                        await self.goto([bed], what="the bed", avoid=False)
+                    await self.go([bed], what="the bed")
                 except Interrupted:
                     pass
                 await self.step(30, "state.menu")
@@ -68,7 +62,7 @@ class Rest:
             else:
                 raise ActionError("couldn't get the sleep prompt at the bed")
             await self.dialogue(0)
-        return await self.finish_night(day)
+        return {"went_to_bed": await self.read("time.text")}
 
     async def finish_night(self, day: int | None = None) -> dict:
         """Go through the end-of-night screens until morning, or until something needs a choice. Without day, morning is when the night screens are over."""

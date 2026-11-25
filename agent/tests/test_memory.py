@@ -2,8 +2,8 @@
 
 import asyncio
 import json
-import os
 from pathlib import Path
+import os
 from types import SimpleNamespace as NS
 
 import pytest
@@ -24,7 +24,7 @@ DATE = "Tue spring 4, year 1"
 
 
 def brain_with(memory):
-    return Brain(Context(None, memory=memory), api_key="x", model="m", system="s", web=False)
+    return Brain(Context(None, memory=memory), api_key="x", model="m", system="s")
 
 
 def make_director(tmp_path, monkeypatch=None, memory_model="hy4-flash", client=None, verbose=False):
@@ -32,7 +32,7 @@ def make_director(tmp_path, monkeypatch=None, memory_model="hy4-flash", client=N
     save = SaveData(tmp_path / "data", "Farm_1")
     save.prepare(old_root=tmp_path / "old")
     brain = NS(messages=[], usage=NS(turns=0), client=client, on_context=None)
-    d = Director(FakeGame(), brain, Context(FakeGame()), goal="farm", save=save, show=lambda kind, text, data=None, ok=True: shown.append((kind, text, data, ok)),
+    d = Director(FakeGame(), brain, Context(FakeGame()), save=save, show=lambda kind, text, data=None, ok=True: shown.append((kind, text, data, ok)),
                  memory_model=memory_model, verbose=verbose)
     d.shown = shown
     if monkeypatch:
@@ -40,7 +40,7 @@ def make_director(tmp_path, monkeypatch=None, memory_model="hy4-flash", client=N
             return {"date": DATE}
 
         async def items(g):
-            return {"items": [{"name": "Parsnip"}]}
+            return [{"name": "Parsnip"}]
 
         async def status(g):
             return "status: 9:00 am on the Farm"
@@ -86,7 +86,7 @@ def test_memory_limits(tmp_path):
     assert b._memory("remember", {"key": "fact.3", "value": "replacing is fine"}).ok  # a full memory can still change a fact
 
 
-def test_the_planner_tools_change_memory_while_it_plays(make_brain):
+def test_the_agent_tools_change_memory_while_it_plays(make_brain):
     from conftest import call, play, reply
 
     b, ctx, sent = make_brain([reply(call("remember", {"key": "farm.chest", "value": "by the house (64,15)"}), call("forget", {"key": "x"}, id="c2"))])
@@ -154,6 +154,7 @@ def test_the_cli_takes_a_data_flag(monkeypatch):
     seen = {}
     monkeypatch.setattr("sys.argv", ["stardew", "play", "--data", "/somewhere", "--memory-model", "none"])
     monkeypatch.setattr(cli, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(cli, "ROOT", Path("/nonexistent"))  # not the user's own stardew.toml
     monkeypatch.setattr(cli.asyncio, "run", lambda coro: (seen.update(coro.cr_frame.f_locals), coro.close()))
     cli.main()
     args = seen["args"]
@@ -188,6 +189,8 @@ def test_each_day_is_written_to_its_own_transcript_and_loaded_back(tmp_path):
         save.record("day", date)
         save.record("result", "done", {"name": "harvest", "value": Image("A" * 50_000), "status": {"clock": 900}, "big": "x" * 30_000})
         save.record("notes", "remembered farm.chest (1 keys)", {"key": "farm.chest", "value": "here"})
+        assert not save.days_dir.exists() or len(list(save.days_dir.iterdir())) < 2  # nothing of the day is written during it
+        save.end_day()
     assert sorted(p.name for p in save.days_dir.iterdir()) == ["0001-spring-03.jsonl", "0001-spring-04.jsonl"]
     days = save.load_days()
     assert [d[0]["text"] for d in days] == ["before the day", "Tue spring 4, year 1"]
@@ -201,6 +204,7 @@ def test_days_load_in_calendar_order_and_only_the_last_seven(tmp_path):
     dates = [f"Mon {season} {day}, year {year}" for year in (1, 2) for season in ("spring", "summer", "fall", "winter") for day in (1, 28)]
     for date in dates:
         save.record("day", date)
+        save.end_day()
     assert [d[0]["text"] for d in save.load_days(7)] == dates[-7:]
     assert day_key("Sun winter 28, year 12") == "0012-winter-28"
 
@@ -212,6 +216,7 @@ def test_the_full_screen_view_loads_past_days(tmp_path):
         save.record("plan", "started", {"script": "harvest()", "goal": "chores"})
         save.record("result", "done", {"name": "harvest", "args": {}, "value": None, "status": {"clock": 900}})
         save.record("notes", f"diary, {date}: shipped parsnips")
+        save.end_day()
     tui = TUI(Console(file=open(os.devnull, "w")))
     tui.load(save.load_days())
     assert [d.title for d in tui.days] == ["Mon spring 3, year 1", "Tue spring 4, year 1"]
@@ -225,6 +230,8 @@ def test_the_director_records_what_it_shows(tmp_path):
     d = make_director(tmp_path)
     d.show("day", DATE)
     d.show("info", "hello")
+    assert not (d.save.days_dir / "0001-spring-04.jsonl").exists()  # written when the day ends
+    d.save.end_day()
     lines = [json.loads(l) for l in (d.save.days_dir / "0001-spring-04.jsonl").read_text().splitlines()]
     assert [(l["kind"], l["text"]) for l in lines] == [("day", DATE), ("info", "hello")]
     assert d.shown[-1][:2] == ("info", "hello")
@@ -240,7 +247,7 @@ def saved_messages():
                                          {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "A" * 100_000}}]}]
 
 
-def test_the_context_is_saved_after_each_planner_turn(tmp_path):
+def test_the_context_is_saved_after_each_agent_turn(tmp_path):
     d = make_director(tmp_path)
     d.date = DATE
     d.brain.usage.turns = 5
@@ -256,7 +263,7 @@ def test_a_restart_starts_the_day_from_its_morning(tmp_path, monkeypatch):
     d = make_director(tmp_path, monkeypatch)
     d.save.save_context(DATE, saved_messages(), turns=7)
     prompt = asyncio.run(d.opening(DATE))
-    assert d.brain.messages == [] and prompt.startswith("GOAL: farm") and "an errand or a few hours" in prompt
+    assert d.brain.messages == [] and prompt.startswith("# Memory") and "short first script" in prompt
 
 
 # --- consolidation -------------------------------------------------------------------------------------------
@@ -362,3 +369,29 @@ def test_losing_most_of_the_text_is_refused(tmp_path):
     d.memory.save()
     asyncio.run(d.consolidate(DATE, "a day"))
     assert d.memory.facts == {"notes": "x" * 400} and "characters" in d.shown[-1][1]
+
+
+def test_the_planner_keeps_its_goals_and_conversation_across_nights(tmp_path):
+    from stardew_agent.planner import Planner
+
+    def block(**b):
+        return NS(**b, model_dump=lambda **_: b)
+
+    class Client:
+        def __init__(self):
+            self.seen = []
+            self.messages = NS(create=self.create)
+
+        async def create(self, **kw):
+            self.seen.append(len(kw["messages"]))
+            plan = block(type="tool_use", name="plan", id=f"p{len(self.seen)}", input={"goals": "Spring Crops bundle", "tomorrow": "plant potatoes"})
+            return NS(content=[plan], usage=NS(input_tokens=10, cache_read_input_tokens=0))
+
+    client = Client()
+    planner = Planner(client, "m", tmp_path / "planner.json")
+    asyncio.run(planner.night("Mon spring 1", "a diary"))
+    planner.save()
+    again = Planner(client, "m", tmp_path / "planner.json")
+    asyncio.run(again.night("Tue spring 2", "another diary"))
+    assert "Spring Crops bundle" in again.morning() and "plant potatoes" in again.morning()
+    assert client.seen == [1, 5]  # the second night sees the first: its opening, the plan call and result, and the close

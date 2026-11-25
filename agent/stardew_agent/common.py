@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 from collections.abc import Iterable
 
 Tile = tuple[int, int]
@@ -10,6 +11,15 @@ FREE = "state.free"
 
 class ActionError(Exception):
     """Something couldn't be done, with a reason worth telling the model."""
+
+
+def unknown(what: str, name: object, known: dict[str, str]) -> str:
+    """An error for a name nothing has, with the nearest exact names (known: each name or title to match -> what to show)."""
+    keys = {k.lower(): v for k, v in known.items() if k}
+    text = str(name).lower()
+    close = difflib.get_close_matches(text, list(keys), n=8, cutoff=0.5) + [k for k in keys if text and text in k]
+    picks = list(dict.fromkeys(keys[k] for k in close))[:6]
+    return f"{what} {name!r}" + (f"; did you mean: {', '.join(picks)}" if picks else "")
 
 
 class Interrupted(ActionError):

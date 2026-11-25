@@ -18,7 +18,7 @@ Asks the judge to choose the option that fits the description, and returns that 
 
 ```python
 if backpack.food:
-    eat(pick("the cheapest food", backpack.food))
+    pick("the cheapest food", backpack.food).eat()
 ```
 
 ## What the judge sees
@@ -38,8 +38,8 @@ Good at:
 - coarse facts it sees: "it's raining", "it's evening", "health is low".
 
 Bad at:
-- sums and counting: do arithmetic in Python (`money() // price`, `sum(...)`), and compare numbers yourself (`energy() < 50` is surer and cheaper than `check("energy is low")`);
-- things it doesn't see (above): "the crops need water" (use `find("crops_thirsty")`), "the backpack has seeds" (look at `backpack.items`);
+- sums and counting: do arithmetic in Python (`farmer.money // price`, `sum(...)`), and compare numbers yourself (`farmer.energy < 50` is surer and cheaper than `check("energy is low")`);
+- things it doesn't see (above): "the crops need water" (use `here.find("crops_thirsty")`), "the backpack has seeds" (look at `backpack.items`);
 - borderline cases: near a threshold ("health is below half" at 52%) it may raise `Unsure`.
 
 Prefer plain Python whenever a fact is available; use the judge for words.
@@ -52,7 +52,7 @@ try:
     food = pick("the cheapest food", backpack.food)
 except Unsure:
     food = backpack.food[0]
-eat(food)
+food.eat()
 ```
 
 `answer("a description")` uses the judge too and can raise `Unsure` (`docs("people#answer")`). All the exception classes: `docs("exceptions")`.

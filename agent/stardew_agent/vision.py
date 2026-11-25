@@ -15,21 +15,28 @@ from . import driver as d
 from .game import Game
 
 COLORS = {"npc": (120, 220, 255), "monster": (255, 120, 120), "exit": (255, 230, 90), "object": (170, 255, 150)}
-SIZES = {"small": 768, "full": 1456}
+MAX_SIDE = 768  # pixels
 save_to: Path | None = None  # where full-size screenshots are kept (the save's screenshots/ folder), if anywhere
 
 
-def keep(image: Image.Image) -> Path | None:
-    """Save the full-size frame, for looking at later."""
-    if save_to is None:
-        return None
+kept: list[tuple[str, Image.Image]] = []  # today's full-size frames, written when the day ends
+
+
+def keep(image: Image.Image) -> None:
+    """Keep the full-size frame, for looking at later; it's written at the end of the day."""
+    if save_to is not None:
+        kept.append((f"{time.strftime('%Y%m%d-%H%M%S')}-{time.monotonic_ns() % 1000:03d}.jpg", image))
+
+
+def write_kept() -> None:
     try:
-        save_to.mkdir(parents=True, exist_ok=True)
-        path = save_to / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.monotonic_ns() % 1000:03d}.jpg"
-        image.save(path, "JPEG", quality=90)
-        return path
+        if save_to is not None and kept:
+            save_to.mkdir(parents=True, exist_ok=True)
+            for name, image in kept:
+                image.save(save_to / name, "JPEG", quality=90)
     except OSError:
-        return None  # a full disk mustn't stop play
+        pass  # a full disk mustn't stop play
+    kept.clear()
 
 
 async def labels(g: Game) -> list[tuple[int, int, str, str]]:
@@ -49,7 +56,7 @@ async def labels(g: Game) -> list[tuple[int, int, str, str]]:
     return found
 
 
-async def capture(g: Game, *, size: str = "small", radius: int | None = None, label: bool = True, grid: bool = False) -> tuple[str, dict]:
+async def capture(g: Game, *, radius: int | None = None, grid: bool = False) -> tuple[str, dict]:
     """Returns a base64 JPEG, and how to convert its pixels back to UI positions."""
     shot: dict[str, Any] = await g.d.one(d.frame())
     if "error" in shot:
@@ -66,7 +73,7 @@ async def capture(g: Game, *, size: str = "small", radius: int | None = None, la
         box = (max(0, int(cx - reach)), max(0, int(cy - reach)), min(image.width, int(cx + reach)), min(image.height, int(cy + reach)))
         if box[2] - box[0] > 32 and box[3] - box[1] > 32:
             image, ox, oy = image.crop(box), box[0], box[1]
-    scale = min(1.0, SIZES[size] / max(image.size))
+    scale = min(1.0, MAX_SIDE / max(image.size))
     if scale < 1:
         image = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
 
@@ -88,7 +95,7 @@ async def capture(g: Game, *, size: str = "small", radius: int | None = None, la
         for y in range(y0, y0 + int(image.height / unit) + 2):
             draw.line([(0, pixel(0, y)[1]), (image.width, pixel(0, y)[1])], fill=(255, 255, 255))
             write(1, pixel(0, y)[1] + 1, str(y), (255, 255, 0))
-    if label and world and not await g.read("state.menu"):
+    if world and not await g.read("state.menu"):
         for x, y, text, kind in await labels(g):
             px, py = pixel(x, y)
             if 0 <= px < image.width and 0 <= py < image.height:
