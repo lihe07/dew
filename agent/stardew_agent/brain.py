@@ -17,10 +17,10 @@ from .driver import BridgeError
 from . import docs, look
 from .api.screen import Screen
 from .look import news, status
-from .memory import MAX_KEY, MAX_VALUE
+from .memory import MAX_KEY, MAX_VALUE, Memory
 from .script import Context, Outcome, Rejected, Runner, Step
 
-REMEMBER = {"name": "remember", "description": "Keep a fact for future days, by a short dotted key (like shop.pierre.hours, plan.tomorrow, farm.chest); this sets or replaces it. Your memory is all you keep besides an automatic diary; it's shown every morning.",
+REMEMBER = {"name": "remember", "description": "Keep a fact for future days, by a short dotted key (like shop.pierre.hours, plan.tomorrow, farm.chest); this sets or replaces it. Your memory is all you keep besides the planner's diary and plan; it's shown every morning.",
             "input_schema": {"type": "object", "additionalProperties": False, "required": ["key", "value"], "properties": {
                 "key": {"type": "string", "maxLength": MAX_KEY, "description": "A short dotted name"},
                 "value": {"type": "string", "maxLength": MAX_VALUE, "description": "The fact, as short text"}}}}
@@ -73,13 +73,11 @@ DOCS_KEPT = 4  # turns a doc result stays whole
 
 
 class Brain:
-    def __init__(self, ctx: Context, *, api_key: str, model: str, system: str, max_context: int = 70_000):
+    def __init__(self, ctx: Context, *, api_key: str, model: str, system: str):
         self.ctx, self.model, self.system = ctx, model, system
-        self.max_context = max_context
         self.max_turns: int | None = None  # no cap, except briefly at night (Director.think)
         self.usage = Usage()
         self.messages: list[dict] = []
-        self.summary_model: str | None = None
         self.inbox: list[str] = []
         self._sent: list[tuple[float, str]] = []  # the player's messages not yet read, and when they came
         self.stop_reason: str | None = None
@@ -91,6 +89,7 @@ class Brain:
         self._poke = asyncio.Event()  # the player steered, or the director ended the turn
         self.runner = Runner(ctx, self._steps.put_nowait, self._wake.set)
         self.research: Research | None = None  # set by whoever has the TinyFish key
+        self.custom_id: str | None = None  # Respan's custom ID for the agent's requests: <save folder>-<day>, set each morning
 
     def reset(self) -> None:
         self.messages.clear()
@@ -185,7 +184,8 @@ class Brain:
                     outcome = Outcome(f"only {', '.join(sorted(self.ctx.only_tools))} can be used now", ok=False)
                 elif call.name in ("remember", "forget"):  # memory changes at once, even while a script runs
                     outcome = self._memory(call.name, args)
-                    yield Step("notes", outcome.text if outcome.ok else f"{call.name} refused: {outcome.text}", outcome.ok, {"key": args.get("key"), "value": args.get("value")})
+                    text, data = Memory.note(call.name, args, outcome.ok, outcome.text)
+                    yield Step("notes", text, outcome.ok, data)
                 elif call.name == "query":
                     source = args.get("script")
                     if not isinstance(source, str) or not source.strip():
@@ -237,7 +237,7 @@ class Brain:
                 if self.ctx.finished or r.error:
                     break
             self._append("user", await self._observe())
-            await self._shrink(response)
+            self._shrink()
         if r.error:
             raise r.error
 
@@ -297,16 +297,7 @@ class Brain:
         return Outcome(f"{done}\n{self.runner.describe()}")
 
     def _memory(self, name: str, args: dict) -> Outcome:
-        """Handle remember and forget."""
-        memory = self.ctx.memory
-        if name == "remember":
-            if set(args) != {"key", "value"}:
-                return Outcome("remember takes key (a short dotted name) and value (short text)", ok=False)
-            ok, text = memory.remember(args["key"], args["value"])
-        else:
-            if set(args) != {"key"}:
-                return Outcome("forget takes key", ok=False)
-            ok, text = memory.forget(args["key"])
+        ok, text = self.ctx.memory.use(name, args)
         return Outcome(text, ok)
 
     def _news(self, full: bool = True) -> list[dict]:
@@ -360,14 +351,6 @@ class Brain:
             return [{"type": "text", "text": f"no screenshot: {ex}"}]
         return [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image.data}}, {"type": "text", "text": "the screen now"}]
 
-    async def summarize(self, prompt: str, max_tokens: int = 1500) -> str:
-        """Summarize the conversation so far, without tools, with the summary model (the main model by default, whose cache makes it cheapest)."""
-        model = self.summary_model or self.model
-        messages = self._join(self.messages, "user", [{"type": "text", "text": prompt}])
-        response = await self.client.messages.create(model=model, max_tokens=max_tokens, system=self.system, messages=messages, **({} if "claude" in model else {"thinking": {"type": "disabled"}}))
-        self._count(response, 0)
-        return "\n".join(b.text for b in response.content if b.type == "text").strip()
-
     async def _web(self, args: dict) -> Outcome:
         """The web tool: a small research subagent answers, so searched pages never enter this context."""
         question = args.get("question")
@@ -385,14 +368,11 @@ class Brain:
     # --- internals -----------------------------------------------------------------------------------------
 
     def _append(self, role: str, content: list) -> None:
-        self.messages = self._join(self.messages, role, content)
-
-    @staticmethod
-    def _join(messages: list[dict], role: str, content: list) -> list[dict]:
-        """The messages and one more, joined to the last if it's from the same side, since the sides must alternate."""
-        if messages and messages[-1]["role"] == role:
-            return [*messages[:-1], {"role": role, "content": [*messages[-1]["content"], *content]}]
-        return [*messages, {"role": role, "content": content}]
+        """Add a message, joined to the last if it's from the same side, since the sides must alternate."""
+        if self.messages and self.messages[-1]["role"] == role:
+            self.messages[-1] = {"role": role, "content": [*self.messages[-1]["content"], *content]}
+        else:
+            self.messages.append({"role": role, "content": content})
 
     def _keep(self, response: Any) -> list[dict]:
         """Choose which blocks to send back on later turns."""
@@ -424,6 +404,7 @@ class Brain:
                 response = await self.client.messages.create(
                     model=self.model, max_tokens=6000, tools=TOOLS, messages=self.messages,
                     system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
+                    **({"metadata": {"respan_params": {"custom_identifier": self.custom_id}}} if self.custom_id else {}),
                     **({"thinking": {"type": "disabled"}} if self.effort == "off" else {"extra_body": {"output_config": {"effort": self.effort}}}),
                 )
             except anthropic.RateLimitError:
@@ -462,16 +443,11 @@ class Brain:
             else:
                 b["text"] = short
 
-    async def _shrink(self, response: Any) -> None:
-        """Keep the context small. Done rarely, since it invalidates the prompt cache."""
+    def _shrink(self) -> None:
+        """Keep the context small: old screenshots and stale observations go. Done rarely, since it invalidates the prompt cache."""
         blocks = [c for m in self.messages if m["role"] == "user" for b in m["content"] for c in ([b] if b.get("type") != "tool_result" else b["content"] if isinstance(b["content"], list) else [])]
         images = [b for b in blocks if b.get("type") == "image"]
         for block in images[:-2] if len(images) > 6 else []:
             block.clear()
             block.update(type="text", text="(old screenshot removed)")
         self._trim()
-        used = (response.usage.input_tokens or 0) + (getattr(response.usage, "cache_read_input_tokens", 0) or 0)
-        if used > self.max_context:
-            summary = await self.summarize("Summarize this day so far for yourself: what you did, what you learned, positions that matter, and your plan for the rest of the day. Under 300 words.")
-            opening, latest = self.messages[0]["content"][0], [b for b in self.messages[-1]["content"] if b.get("type") == "text"]
-            self.messages = [{"role": "user", "content": [opening, {"type": "text", "text": f"(Earlier turns were summarized.)\n{summary}\n\nContinue the day. The latest:"}, *latest]}]

@@ -154,7 +154,7 @@ def make_brain(monkeypatch, acts):
             return responses.pop(0)
 
         monkeypatch.setattr(b, "_send", send)
-        monkeypatch.setattr(b, "_shrink", lambda r: asyncio.sleep(0))
+        monkeypatch.setattr(b, "_shrink", lambda: None)
         monkeypatch.setattr(b, "_keep", lambda r: [{"type": "text", "text": "ok"}])
         monkeypatch.setattr(b, "_check_limits", lambda: None)
         return b, ctx, sent

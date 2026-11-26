@@ -4,7 +4,7 @@ An AI agent that plays Stardew Valley 1.6 by the real rules: it walks everywhere
 
 ```
 stardew play (Python)                                          Stardew Valley + SMAPI
-  Director  days, diary, memory, bedtime                        Stardew Bridge mod (C#)
+  Director  days, the night, bedtime                            Stardew Bridge mod (C#)
   Brain     agent model: run, wait, screenshot, web, remember, forget◀── socket ──▶  attach input step read frame path follow cheat
   Runner    plays the agent's Python scripts                    + a journal of everything shown on screen
   Skills    walk, swing, click, travel, fish...
@@ -44,8 +44,6 @@ Tests: `just test` (offline: fakes for the game and the model, no network) and `
 | `--save FOLDER` | load this save if none is loaded |
 | `--new NAME` | start a new game if none is loaded |
 | `--model MODEL` | agent model, any gateway model (default `deepseek-v4.1-flash`, or `$STARDEW_MODEL`) |
-| `--summary-model MODEL` | model for the daily diary and context compaction (default: `--model`, whose prompt cache makes it cheapest) |
-| `--memory-model MODEL` | model which tidies the memory each night (default `hy4-flash`; `none` turns it off) |
 | `--data DIR` | where the agent keeps its data (default `$STARDEW_DATA`, else `./stardew-data`; `just` sets it to `stardew-data/` where you ran it) |
 | `--effort LEVEL` | how hard the agent reasons: `low` (default), `medium`, `high`, `off` |
 | `--speed N` | how fast the world runs, single-player only (default 1; up to 16, but faster makes combat reflexes less reliable) |
@@ -71,7 +69,7 @@ The world never pauses: it runs while the agent thinks, as in multiplayer. In si
 
 Every wake-up carries the farmer's status and a text map around it. For more, a script reads the live objects (`farmer`, `day`, `here.find`, `here.map`, `mine`, `people`, `places`, `catalog`, `quests`, `recipes`) and prints what the agent needs.
 
-The model is woken when a script ends, raises an exception it doesn't catch, or calls `ask(question)` (which ends it), when it prints (`print` queues a message and wakes the agent while the script keeps running; messages are batched, at most one wake-up every 30 seconds), and when you steer or the day ends. Old screenshots are dropped and the context is summarized once it passes about 70k tokens.
+The model is woken when a script ends, raises an exception it doesn't catch, or calls `ask(question)` (which ends it), when it prints (`print` queues a message and wakes the agent while the script keeps running; messages are batched, at most one wake-up every 30 seconds), and when you steer or the day ends. Old screenshots and stale observations are dropped; the context is never summarized, so a day's whole conversation stays.
 
 **2. span-02** (`decide.py`, `combat.py`), a fast decision model on the Respan gateway (`/v1/decisions`). In scripts, `check(situation)` returns True or False and `pick(description, options)` returns one option; both raise `Unsure` below 0.6 confidence. It reads plain facts (time, minutes until 2am, weather, location, health, energy, money, free slots, what is held, the last result, recent dialogue) and compares but can't do arithmetic. In `descend`, `combat.Tactics` asks the same judge to choose between options that are all already safe, such as fighting nearby monsters or taking a visible ladder; below 0.4 confidence it takes the safe default.
 
@@ -129,7 +127,7 @@ Surprise
 
 ## What you see
 
-In a terminal, a full-screen view: the day's transcript on the left (the agent's reasoning, each script's goal, one line per action with its result, items, and places walked through, `check`/`pick` decisions, safety stops), and on the right the running script with its current line marked and the farmer's status. Tabs along the top switch between days (←/→); ↑/↓ scroll; a past day shows its diary. The save's last 7 days are loaded from its transcripts at start, so they can be looked through after a restart. Piped or with `--plain`, the same lines are printed one after another.
+In a terminal, a full-screen view: the day's transcript on the left (the agent's reasoning, each script's goal, one line per action with its result, items, and places walked through, `check`/`pick` decisions, safety stops), and on the right the running script with its current line marked, the Day (the planner's plan for it, its diary, and on the latest day the plan for tomorrow once the night has written it), and the farmer's status. Tabs along the top switch between days: ←/→ a day, Shift+←/→ a week, Ctrl+←/→ the first day and today; the tabs scroll to keep the day shown in view, with counts of those left out at either end. ↑/↓ scroll. The save's last 7 days are loaded from its transcripts at start, so they can be looked through after a restart. Piped or with `--plain`, the same lines are printed one after another.
 
 ## Steering from the terminal
 
@@ -140,8 +138,8 @@ In the game, **F8** gives you control: the script stops, the guard and the agent
 ## Memory
 
 - **Memory** (`memory.py`): the model's one lasting memory, facts by short dotted key (`shop.pierre.hours`, `plan.tomorrow`, `farm.chest`), set with `remember` and removed with `forget`. Keys are at most 60 characters, values 500, and there are at most 150 keys (more is refused, telling the model to forget stale ones). All of it is shown every morning under `# Memory`, sorted by key. It's saved in `memory.json`, written atomically.
-- **Consolidation**: each night, after the diary, `--memory-model` (default `hy4-flash`, thinking disabled) gets the memory and the day's diary and returns the whole new memory as JSON: duplicates merged, stale facts dropped, contradicted values fixed, nothing invented. It's applied only if it's a JSON object of text to text within the limits that keeps at least half the keys; the old memory goes to `memory.json.bak`. Otherwise the memory stays as it was and the reason is shown. The display shows a line like `memory consolidated: 42 → 37 keys (merged 3, dropped 2, changed 1)`, and with `--verbose` each changed key.
-- **Diary**: at the end of each day the summary model writes under 120 words, appended to `diary.jsonl`. The last 7 days are shown each morning. `--summary-model` picks which model writes it; the same model also compacts the context mid-day.
+- **The night** (`planner.py`): once the farmer is in bed, the planner (`--planner-model`, default the agent's model, at `--planner-effort`) gets the record of the day as the agent played it (its thoughts and scripts, results cut short), the day's numbers, the memory and the farmer's state. It tidies the memory with `remember` and `forget` (duplicates merged, stale facts dropped, contradicted values fixed, nothing invented), may look things up with `web`, and ends with `plan`: the diary of the day, the long-term goals, and tomorrow's plan. Its conversation is kept for 14 nights in `planner.json`, each past night's record replaced by the diary it wrote. A night that fails keeps last night's goals and plan, and writes no diary.
+- **Diary**: the planner's under-120-word summary of each day, ended by the day's numbers, appended to `diary.jsonl`. The last 7 days are shown each morning.
 - Nothing else carries over between days. If the day ends without the agent going to bed (it stops answering, or the gateway refuses a request), the model gets three more turns, with only `remember` and `forget`, and the farmer is put to bed.
 - An old `notes.md` (from the `note` tool, now gone) is imported once into the key `notes` and renamed `notes.md.imported`.
 
@@ -151,14 +149,15 @@ Each save has a folder, `<data>/<farm name>_<game id>/`, where `<data>` is `--da
 
 ```
 stardew-data/Farm_123456789/
-  memory.json          the facts (memory.json.bak: before the last consolidation)
+  memory.json          the facts
   diary.jsonl          one summary a day
+  planner.json         the planner's goals, tomorrow's plan, and its last 14 nights of conversation
   days/0001-spring-04.jsonl   every step shown that day: {"kind", "text", "ok", "data"}, images left out
   context.json         the agent's messages for the last finished day (screenshots dropped), a record
   screenshots/         every screenshot the agent takes, full size
 ```
 
-The memory and the context reach disk only when a day ends (after the diary and the night's consolidation), as the game itself saves only when you sleep. A run stopped partway through a day starts that day again from its morning report, just as the game starts it again from its morning. Data from before (`~/.local/share/stardew-agent/<save>/`) is moved into the new folder once, if that folder doesn't exist yet.
+The memory and the context reach disk only when a day ends (after the planner's night), as the game itself saves only when you sleep. A run stopped partway through a day starts that day again from its morning report, just as the game starts it again from its morning. Data from before (`~/.local/share/stardew-agent/<save>/`) is moved into the new folder once, if that folder doesn't exist yet.
 
 - `sleep` saves the game. Use a save you don't mind it playing. When the agent exits it leaves the game paused in the menu.
 
@@ -196,8 +195,9 @@ bridge/               the mod (C#): Server, Machine (instructions), Devices (inp
 agent/stardew_agent/
   layer 3, the agent
     brain.py          the agent loop (tools run, wait, screenshot, web, remember, forget), context limits, steering
-    director.py       days, the morning report, memory and its nightly consolidation, diary, saving at the day's end, bedtime
-    memory.py         the memory: remember, forget, memory.json, consolidation
+    director.py       days, the morning report, the night, the diary, saving at the day's end, bedtime
+    planner.py        the night: the day's record, memory edits, the diary, the goals and tomorrow's plan
+    memory.py         the memory: remember, forget, memory.json
     storage.py        the save's data folder: paths, day transcripts, the saved context, moving old data
     prompt.md         the agent's system prompt
     look.py           views of the game (map, find, people, ...), the status line, journal news

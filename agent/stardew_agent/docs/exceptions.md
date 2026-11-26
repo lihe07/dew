@@ -12,7 +12,6 @@ Surprise                         anything unexpected
 │   ├── LowHealth
 │   ├── LowEnergy
 │   └── TimeToGoHome(minutes_home, minutes_left)
-├── Stuck                        the farmer isn't getting anywhere
 ├── Happened(text)               something needs a decision first
 │   ├── Question(text, choices)
 │   └── Cutscene(text)
@@ -55,9 +54,6 @@ Raised when health drops below 30% of the maximum, and by the guard when it retr
 
 ## LowEnergy
 Raised when energy drops below 15. Eat something (`docs("items#Item.eat")`), soak (`docs("time#soak")`), or do work that costs no energy (talking, shopping, foraging, petting). At about 4 energy or less, tool swings refuse: `out of energy; eat something or sleep` (NotEnough).
-
-## Stuck
-Raised by an always-on check, for what the other checks miss: when an action has run 45 seconds (then every 30; not `fish`, `sleep`, `soak` or `wait`, which are long by nature), and after any failed action, the judge looks at the last actions, the farmer's recent positions and what was said, and decides whether the farmer is making progress or is stuck (repeating without progress, walking in place, blocked, waiting for something that won't happen). Only when it's sure (0.7 or more) is the action stopped and `Stuck` raised: "go target=… isn't getting anywhere", or "the same thing keeps failing". Catch it to try another way, or let it wake you.
 
 ## TimeToGoHome
 Raised from 6pm on, when the walk home (an estimate, recomputed when the location changes or every 30 game minutes) plus 15 minutes no longer fits before midnight. It carries `minutes_home` and `minutes_left` (until 2am). Going to bed after midnight costs energy the next morning, and at 2am you pass out wherever you are: see `docs("time#Getting home")`.

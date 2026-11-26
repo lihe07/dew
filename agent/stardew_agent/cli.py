@@ -113,18 +113,17 @@ async def play(args: argparse.Namespace) -> None:
         folder = f"{await game.read('game.player.farmName')}_{await game.read('game.uniqueIDForThisGame')}"
         ctx = Context(game, while_idle=lambda stop: combat.keep_busy(game, stop), decide=Decider(key))
         brain = Brain(ctx, api_key=key, model=args.model, system=PROMPT)
-        brain.summary_model, brain.effort = args.summary_model, args.effort
+        brain.effort = args.effort
         if (tinyfish := os.environ.get("TINYFISH_API_KEY")) and not args.no_web:
             brain.research = Research(brain.client, args.web_model, tinyfish)
         save = SaveData(data_root(args.data), folder)
         said = save.prepare()
         vision.save_to = save.screenshots
-        memory_model = None if args.memory_model.lower() == "none" else args.memory_model
         panels = sys.stdout.isatty() and sys.stdin.isatty() and not args.plain
         if panels:
-            await play_in_panels(args, game, brain, ctx, save, said, memory_model)
+            await play_in_panels(args, game, brain, ctx, save, said)
             return
-        director = Director(game, brain, ctx, save=save, planner=planner(args, brain, save), show=show, memory_model=memory_model, verbose=args.verbose)
+        director = Director(game, brain, ctx, save=save, planner=planner(args, brain, save), show=show)
         display.verbose = args.verbose
         for line in said:
             director.show("info", line)
@@ -149,7 +148,7 @@ def planner(args: argparse.Namespace, brain: Brain, save: SaveData) -> Planner:
     return Planner(brain.client, args.planner_model or args.model, save.planner_file, research=brain.research, effort=args.planner_effort)
 
 
-async def play_in_panels(args: argparse.Namespace, game: Game, brain: Brain, ctx: Context, save: SaveData, said: list[str], memory_model: str | None) -> None:
+async def play_in_panels(args: argparse.Namespace, game: Game, brain: Brain, ctx: Context, save: SaveData, said: list[str]) -> None:
     """The full-screen view, with a tab per day; the save's last 7 days are loaded, so they can be looked through."""
     console.print(f"[grey50]{args.model} · {save.folder} · F8 in the game takes control[/]")
     tui = TUI(console, header="F8 takes control")
@@ -157,7 +156,7 @@ async def play_in_panels(args: argparse.Namespace, game: Game, brain: Brain, ctx
     tui.waiting = lambda: [goal for _, goal in brain.runner.waiting]
     tui.line = lambda: brain.runner.script.line if brain.runner.script else None
     tui.load(save.load_days(7))
-    director = Director(game, brain, ctx, save=save, planner=planner(args, brain, save), show=tui.show, memory_model=memory_model, verbose=args.verbose)
+    director = Director(game, brain, ctx, save=save, planner=planner(args, brain, save), show=tui.show)
     for line in said:
         director.show("info", line)
     tui.start()
@@ -204,13 +203,11 @@ def main() -> None:
     p.add_argument("--save", metavar="FOLDER", help="load this save if none is loaded")
     p.add_argument("--new", metavar="NAME", help="start a new game if none is loaded")
     p.add_argument("--model", default=os.environ.get("STARDEW_MODEL", "deepseek-v4.1-flash"))
-    p.add_argument("--summary-model", metavar="MODEL", help="model for the daily diary and compaction (default: --model, whose cache makes it cheapest), e.g. hy4-flash")
-    p.add_argument("--memory-model", metavar="MODEL", default="hy4-flash", help="model which consolidates the memory each night (default hy4-flash; none turns it off)")
     p.add_argument("--data", metavar="DIR", help="where the agent keeps its data (default $STARDEW_DATA, else ./stardew-data)")
     p.add_argument("--effort", default="low", choices=["low", "medium", "high", "off"], help="how hard the agent reasons (default low; the model's own default is high, and slow)")
     p.add_argument("--speed", type=int, default=1, help="how fast the world runs, single-player only (default 1; faster makes combat reflexes less reliable)")
     p.add_argument("--no-web", action="store_true", help="no web lookups")
-    p.add_argument("--planner-model", metavar="MODEL", help="the model of the planner, which plans each night (default: the agent's model)")
+    p.add_argument("--planner-model", metavar="MODEL", help="the model of the planner, which each night writes the diary, tidies the memory and plans tomorrow (default: the agent's model)")
     p.add_argument("--planner-effort", default="high", choices=["low", "medium", "high", "off"], help="how hard the planner reasons (default high: it runs once a day)")
     p.add_argument("--web-model", default="hy4-flash", metavar="MODEL", help="the model of the research helper behind the web tool (default hy4-flash)")
     p.add_argument("--no-map", action="store_true", help="don't print the map after each action")

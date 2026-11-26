@@ -1,4 +1,4 @@
-"""Runs the days: the morning report, memory and the diary, resuming a day after a restart, noticing the day end, and bedtime."""
+"""Runs the days: the morning report, the night (the planner writes the diary, tidies the memory and plans), resuming a day after a restart, noticing the day end, and bedtime."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import dataclasses
 import json
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 
 from . import memory as kv
 
@@ -15,20 +14,17 @@ from .brain import Brain, OutOfBudget
 from .driver import BridgeError, HumanControl
 from .game import ActionError, Game
 from .look import STATUS, news, render, status
-from .planner import Planner
+from .planner import Planner, record
 from .script import Context
-from .storage import SaveData
-
-DIARY = (Path(__file__).parent / "prompts" / "diary.md").read_text().strip()
+from .storage import SaveData, day_key
 
 
 class Director:
-    def __init__(self, game: Game, brain: Brain, ctx: Context, *, save: SaveData, planner: Planner | None = None, show: Callable[..., None] = lambda kind, text, data=None, ok=True: None,
-                 memory_model: str | None = "hy4-flash", verbose: bool = False):
+    def __init__(self, game: Game, brain: Brain, ctx: Context, *, save: SaveData, planner: Planner | None = None, show: Callable[..., None] = lambda kind, text, data=None, ok=True: None):
         self.game, self.brain, self.ctx, self.planner = game, brain, ctx, planner
         if planner:
             planner.show = self.show
-        self.save, self.memory_model, self.verbose = save, memory_model, verbose
+        self.save = save
         self._show = show
         self.after_result: Callable[[], Awaitable[None]] | None = None  # e.g. to draw the map
         self.ended = False  # the day ended without sleep
@@ -56,38 +52,15 @@ class Director:
         file = self.save.diary_file
         return [json.loads(l) for l in file.read_text().splitlines() if l.strip()][-days:] if file.exists() else []
 
-    async def write_diary(self, date: str, summary: str = "") -> str:
-        """Summarize the day while its context is still here, so the coming days remember it; the day's numbers end it as they are."""
-        try:
-            text = await self.brain.summarize(DIARY + (f"\n\nThe end of the day: {summary}" if summary else ""))
-            text = f"{text}\nEnd of day: {summary}" if text and summary else text
-        except Exception as ex:  # a missing summary must never stop the night
-            self.show("error", f"couldn't write the diary: {ex}")
-            return ""
-        if text:
-            self.save.diary_file.parent.mkdir(parents=True, exist_ok=True)
-            with self.save.diary_file.open("a") as f:
-                f.write(json.dumps({"date": date, "summary": text}) + "\n")
-            self.show("notes", f"diary, {date}: {text}")
-        return text
-
-    async def consolidate(self, date: str, diary: str) -> None:
-        """Tidy the memory overnight with a small model; anything doubtful keeps the memory as it was."""
-        if not self.memory_model:
+    def write_diary(self, date: str, text: str, summary: str = "") -> None:
+        """Keep the planner's diary of the day, ended by the day's numbers as they are, so the coming days remember it."""
+        text = f"{text}\nEnd of day: {summary}" if text and summary else text
+        if not text:
             return
-        if not diary:
-            self.show("info", "memory not consolidated: no diary today")
-            return
-        old = dict(self.memory.facts)
-        try:
-            change = await kv.consolidate(self.memory, date, diary, self.brain.client, self.memory_model)
-        except kv.Rejected as ex:
-            self.show("info", f"memory kept as it was: {ex}")
-            return
-        except Exception as ex:  # the gateway may be down; the night goes on
-            self.show("info", f"memory kept as it was: the consolidation failed ({str(ex)[:200]})")
-            return
-        self.show("notes", str(change), {"changes": change.details(old, self.memory.facts)} if self.verbose else {})
+        self.save.diary_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.save.diary_file.open("a") as f:
+            f.write(json.dumps({"date": date, "summary": text}) + "\n")
+        self.show("notes", f"diary, {date}: {text}")
 
     def save_context(self, messages: list[dict]) -> None:
         if not self.date:
@@ -128,6 +101,7 @@ class Director:
         await self.night()
         await self._settle_morning()
         date = self.date = await g.date()
+        self.brain.custom_id = f"{self.save.folder}-{day_key(date)}"
         self.show("day", date)
         self.show("status", "", {"status": await g.read(STATUS)})  # the view's clock and farmer, before any action
         start = await g.read({"money": "player.money", "skills": "player.skills"})
@@ -161,9 +135,7 @@ class Director:
             await self.force_sleep()
         # the day is over once the farmer is in bed: its diary and saves don't wait for the night, which opens the next day
         summary = await self.day_summary(start)
-        diary = await self.write_diary(date, summary)
-        await self.consolidate(date, diary)
-        await self.plan_tomorrow(date, diary)
+        self.write_diary(date, await self.plan_tomorrow(date, summary), summary)
         self.ctx.memory.save()  # everything reaches disk only now that the day is over, as the game's own save does
         self.save_context(self.brain.messages)
         if self.planner:
@@ -171,12 +143,14 @@ class Director:
         self.show("info", f"usage: {self.brain.usage}", {"usage": dataclasses.asdict(self.brain.usage)})
         self.save.end_day()
 
-    async def plan_tomorrow(self, date: str, diary: str) -> None:
-        """The planner's night: it reads the day (the diary, the memory, the farmer's state and friendships) and keeps the goals
-        and tomorrow's plan, which the next morning's report carries."""
+    async def plan_tomorrow(self, date: str, summary: str) -> str:
+        """The planner's night: it reads the day (what the agent did, the day's numbers, the memory, the farmer's state and
+        friendships), edits the memory, and keeps the goals and tomorrow's plan, which the next morning's report carries.
+        Returns its diary of the day."""
         if not self.planner:
-            return
-        parts = [f"# Today's diary\n{diary or '(no diary today)'}", self.memory.section()]
+            return ""
+        parts = [f"# The day, as the agent played it\n{record(self.brain.messages) or '(nothing recorded)'}",
+                 f"# The day's numbers\n{summary or '(not read)'}"]
         try:
             g = self.game
             stats = await g.read({"money": "player.money", "earned": "player.totalMoneyEarned", "deepest": "player.deepestMineLevel"})
@@ -185,8 +159,9 @@ class Director:
         except BridgeError as ex:
             parts.append(f"(the farmer's state couldn't be read: {ex})")
         self.show("info", "the planner is planning tomorrow")
-        await self.planner.night(date, "\n\n".join(parts))
+        diary = await self.planner.night(date, "\n\n".join(parts), self.memory)
         self.show("info", f"the planner used {self.planner.tokens:,} tokens")
+        return diary
 
     async def day_summary(self, start: dict) -> str:
         """The day in numbers: money, what was shipped and sold for how much, and level-ups. (The night's shipping total is in the next morning's report.)"""
@@ -295,7 +270,7 @@ class Director:
         state = await look.state(g)
         parts = [p for p in (self.planner.morning() if self.planner else "", self.memory.section()) if p]
         if week := self.diary():
-            parts.append("# The last days (automatic summaries)\n" + "\n".join(f"- {d['date']}: {d['summary']}" for d in week))
+            parts.append("# The last days (the planner's diary)\n" + "\n".join(f"- {d['date']}: {d['summary']}" for d in week))
         if self.ctx.last_night:
             night = {k: v for k, v in self.ctx.last_night.items() if k in ("notes", "chose")}
             if night.get("notes") or night.get("chose"):

@@ -10,7 +10,7 @@ import re
 import signal
 import sys
 import time
-from collections import Counter, deque
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +23,7 @@ from .game import ActionError, Game, Interrupted
 from .memory import Memory
 from .display import action_lines
 from .look import STATUS, Image, minutes, news, render, status, until_2am
-from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, Stuck, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
+from .sandbox_child import ActionFailed, Closed, Cutscene, LowEnergy, LowHealth, NotEnough, Question, Surprise, TimeToGoHome, Unreachable, Unsure
 
 SURE = 0.6  # the judge's least confidence for an answer to count
 MAX_MESSAGE = 1 << 20  # bytes in one message from a script
@@ -34,11 +34,6 @@ MAX_LOGS = 200  # log lines per script
 WAKE_EVERY = 30  # seconds: a script's messages wake the agent at most this often; meanwhile they wait in the queue
 GATHER = 1.0  # seconds a message waits for more, before it wakes the agent
 QUEUE = 3  # script slots: the running one, and two waiting their turn
-STUCK_AFTER, STUCK_EVERY, SAMPLE = 10, 5, 2  # seconds: an action is first checked after this, then this often; positions every SAMPLE
-STUCK_SURE = 0.75  # how sure the judge must be, twice in a row: a false alarm costs a agent turn
-STUCK = ["the farmer is making progress: moving somewhere new, using energy on work, getting or selling items, or doing something that stays in one place by nature (fishing, fighting, sleeping, soaking, waiting, talking)",
-         "the farmer is stuck: standing or walking in place without getting anywhere, the same action failing again and again, "
-         "or going round in a loop (the same few actions or places over and over without anything changing)"]
 MAX_TEXT = 500  # characters kept of anything else the script's process says
 MAX_LOG_TEXT = 6000  # characters kept of one log line, enough for a map
 MAX_LOG_CHARS = 40_000  # logged characters per script
@@ -138,30 +133,6 @@ def interruption(what: str, choices: list[str] | None) -> Surprise:
 
 
 # --- facts and the judge -----------------------------------------------------------------------------------
-
-
-def stuck_facts(done: list[tuple[str, str, str]], samples: list[dict], now: float) -> dict:
-    """What the stuck check sees: recent actions and positions with their times, and counts worked out for it."""
-    recent = [x for x in samples if now - x["at"] <= 20]
-    before = {(x["place"], x["tile"]) for x in samples if now - x["at"] > 20}
-    steps = sum(abs(a["tile"][0] - b["tile"][0]) + abs(a["tile"][1] - b["tile"][1]) for a, b in zip(recent, recent[1:]) if a["place"] == b["place"])
-    still = 0.0
-    for x in reversed(samples):
-        if (x["place"], x["tile"]) != (samples[-1]["place"], samples[-1]["tile"]):
-            break
-        still = now - x["at"]
-    kinds = Counter(action for _, action, _ in done)
-    places = Counter((x["place"], x["tile"]) for x in samples)
-    return {
-        "recent_actions": [f"{t} {action}: {how}" for t, action, how in done],
-        "positions": [f"{x['clock']} {x['place']} {x['tile']} energy {x['energy']} money {x['money']} ({x['action']})" for x in samples],
-        "tiles_walked_last_20s": steps, "new_tiles_last_20s": len({(x["place"], x["tile"]) for x in recent} - before), "seconds_on_this_tile": round(still),
-        "energy_used_last_20s": (recent[0]["energy"] - recent[-1]["energy"]) if recent else 0,
-        "money_change_last_20s": (recent[-1]["money"] - recent[0]["money"]) if recent else 0,
-        "failures_in_recent_actions": sum(1 for _, _, how in done if how.startswith("failed")),
-        "most_repeated_action": f"{kinds.most_common(1)[0][0]} x{kinds.most_common(1)[0][1]}" if kinds else "none",
-        "most_revisited_tile": f"{places.most_common(1)[0][0]} x{places.most_common(1)[0][1]}" if places else "none",
-    }
 
 
 def facts(t: dict, s: dict) -> dict:
@@ -301,11 +272,6 @@ class Runner:
         self._cancel: BaseException | None = None  # what a cancelled action raises
         self._listening = False
         self._woken_for_messages = -WAKE_EVERY  # when messages last woke the agent
-        self._done: deque[tuple[str, str, str]] = deque(maxlen=12)  # the last actions, for the stuck check: (game time, action, how it went)
-        self._finished: deque[float] = deque(maxlen=4)  # when the last few actions ended, to tell a run of short ones
-        self._samples: deque[dict] = deque(maxlen=15)  # every SAMPLE seconds during an action: game time, place, tile, energy, money, action
-        self._sampled = self._asked = 0.0  # when the farmer was last sampled, and the stuck check last asked
-        self._strikes = 0  # the stuck check's "stuck" verdicts in a row
         self._queued = False  # messages the agent hasn't been woken for
         self.waiting: list[tuple[str, str]] = []  # scripts in slots 2 and 3: (source, goal)
         self.printed: list[tuple[float, str]] = []  # what the script printed (and when), until the agent reads it
@@ -687,10 +653,8 @@ class Runner:
                         break
                     if self._overtime(script):
                         self._cancel = Stopped(script.stopped)
-                    else:
-                        await self._sample(job)
-                        if hit := await self._danger(name, given) or await self._stuck(job):
-                            self._cancel = hit
+                    elif hit := await self._danger(name, given):
+                        self._cancel = hit
                     if self._cancel:
                         self._job.cancel()
                         await asyncio.wait({self._job})
@@ -716,8 +680,6 @@ class Runner:
             else:
                 outcome, value, raised = self._job.result()
             self._record(job, outcome)
-            if not outcome.ok and (stuck := await self._stuck(job, failed=True)):
-                raised = stuck  # failing again and again: say so, rather than the failure alone
             if self.ctx.finished:
                 self.wake("the day ended")
                 raise script.stop("the day ended")
@@ -774,55 +736,8 @@ class Runner:
         # the agent reads the same lines the view draws (display.action_lines), as plain text and uncut
         told = "\n".join(line.plain for line in action_lines(data, outcome.ok, full=True)) if data else f"{job.label}: {outcome.text}"
         self._last = (job.label, told)
-        self._finished.append(time.monotonic())
-        self._done.append((self._samples[-1]["clock"] if self._samples else "", job.label, ("ok" if outcome.ok else "failed: ") + (told.split("\n")[0][len(job.label) + 2:][:150] if not outcome.ok else "")))
         self._trace.append(told)
         self.emit(Step("result", f"{job}: {outcome.text}", outcome.ok, data))
-
-    async def _sample(self, job: Job) -> None:
-        """Every SAMPLE seconds while an action runs: where the farmer is, for the stuck check."""
-        if time.monotonic() - self._sampled < SAMPLE:
-            return
-        self._sampled = time.monotonic()
-        try:
-            at = await self.ctx.game.read({"tile": "player.tile", "place": "location.name", "clock": "time.text", "energy": "player.energy", "money": "player.money",
-                                           "busy": "state.cutscene or state.menu"})
-        except BridgeError:
-            return
-        if at.pop("busy"):  # a cutscene or a dialogue: standing still then is no sign of being stuck, so the check waits
-            self._asked = self._sampled
-            return
-        self._samples.append({**at, "tile": tuple(at["tile"]), "energy": int(at["energy"]), "action": job.label, "at": self._sampled})
-
-    async def _stuck(self, job: Job, failed: bool = False) -> Stuck | None:
-        """The judge's always-on check, for what the other checks miss: is the farmer stuck, failing again and again, or going round
-        in a loop? Asked every STUCK_EVERY seconds while an action runs (once it has run STUCK_AFTER, or a few actions were done), and
-        after a failed action once failures repeat (3 of the last 4 actions; one failure is just a failure, with its own reason).
-        It sees the recent actions and positions with their times, and ready-made counts (it compares well but can't do arithmetic)."""
-        now = time.monotonic()
-        busy = now - job.started >= STUCK_AFTER or len(self._finished) == 4 and now - self._finished[0] <= 6 * STUCK_AFTER  # a long action, or a run of short ones (a loop)
-        if failed and sum(how.startswith("failed") for _, _, how in list(self._done)[-4:]) < 3:
-            return None
-        if not failed and (not busy or now - self._asked < STUCK_EVERY):
-            return None
-        self._asked = now
-        seen = {"running": f"{job.label}, for {now - job.started:.0f}s" if not failed else "nothing (the last action failed)",
-                **stuck_facts(list(self._done), list(self._samples), now)}
-        if not failed and seen["new_tiles_last_20s"] >= 3:  # getting somewhere new is progress; a loop comes back to the same tiles
-            self._strikes = 0
-            return None
-        i, sure = await self._which(STUCK, seen)
-        stuck = i == 1 and sure >= STUCK_SURE
-        self._strikes = self._strikes + 1 if stuck else 0
-        if not stuck or (not failed and self._strikes < 2):
-            return None
-        self._strikes = 0
-        self._trace.append(f"stuck check: stuck ({sure:.2f})")
-        self.emit(Step("judge", f"stuck check: stuck ({sure:.2f})", True, {"saw": seen}))  # what it judged by, for the transcript
-        if failed:
-            _, label, how = self._done[-1]
-            return Stuck(f"failing again and again; the last: {label}: {how.removeprefix('failed: ')}")
-        return Stuck(f"{job.label} isn't getting anywhere")
 
     async def _danger(self, name: str, args: dict) -> Surprise | None:
         """Low health, low energy, or the time to head home, each raised once until it clears. Actions which cure it may run."""

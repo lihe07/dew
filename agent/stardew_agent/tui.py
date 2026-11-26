@@ -1,9 +1,10 @@
-"""The full-screen view: the day's Timeline (the agent's reasoning, its scripts, and each action's result, in order), the Plan
-(the running script, its current line marked), the Farmer (time, place, energy, health, gold), what the agent is doing now, and
-an input box to steer it. One tab per day.
+"""The full-screen view: the day's Timeline (the agent's reasoning, its scripts, and each action's result, in order), the Script
+(the running script, its current line marked), the Day (the planner's plan for it, its diary, and the plan for tomorrow), the
+Farmer (time, place, energy, health, gold), what the agent is doing now, and an input box to steer it. One tab per day.
 
-Keys: Tab focuses the Timeline or the Plan; ↑/↓, PgUp/PgDn, Home/End or the mouse wheel scroll it (End follows the newest again);
-←/→ switch days; type and Enter to queue a message for the agent; q quits when the agent is done.
+Keys: Tab focuses the Timeline or the Script; ↑/↓, PgUp/PgDn, Home/End or the mouse wheel scroll it (End follows the newest again);
+←/→ switch days, Shift+←/→ a week, Ctrl+←/→ the first day and today; type and Enter to queue a message for the agent; q quits
+when the agent is done.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from .display import action_lines, clock, notes_text
+from .planner import TODAY
 
 KEEP = 2000  # lines of actions kept per day
 INDENT = " " * 6  # under the time column: "07:10 "
@@ -47,7 +49,9 @@ class Day:
     status: dict = field(default_factory=dict)
     report: str = ""
     running: str | None = None  # the action under way
+    plan: str = ""  # the planner's plan for this day, from the morning report
     diary: str = ""
+    tomorrow: str = ""  # the planner's plan for the next day, written this night
     usage: dict | None = None  # the agent's usage once the day is over
 
 
@@ -110,6 +114,8 @@ class TUI:
             self.scroll = 0
         elif kind == "report":
             day.report = text
+            if TODAY in text:
+                day.plan = re.split(r"\n# ", text.split(TODAY, 1)[1].strip(), maxsplit=1)[0].strip()
         elif kind == "status":
             day.status.update(data.get("status") or {})
         elif kind == "agent":
@@ -185,6 +191,8 @@ class TUI:
         elif kind == "notes":
             if text.startswith("diary"):
                 day.diary = text.split(":", 1)[-1].strip()
+            elif text.startswith("planner, tomorrow:"):
+                day.tomorrow = text.split(":", 1)[-1].strip()
             else:
                 entry(Text(notes_text(text, data)[:300], "magenta" if ok else "red"))
         else:
@@ -266,7 +274,7 @@ class TUI:
             root["body"].update(self._help())
             return root
         root["body"].split_row(Layout(self._timeline(day), name="timeline", ratio=3), Layout(name="side", ratio=2, minimum_size=40))
-        root["side"].split_column(Layout(self._plan(day), name="plan"), Layout(self._farmer(day, live), size=11))
+        root["side"].split_column(Layout(self._plan(day), name="plan"), Layout(self._day(day)), Layout(self._farmer(day, live), size=11))
         return root
 
     def _panel(self, body: Any, title: str, name: str | None = None, subtitle: str | None = None) -> Panel:
@@ -275,15 +283,18 @@ class TUI:
                      box=box.ROUNDED, border_style="bright_blue" if focused else "grey35", padding=(0, 1))
 
     def _header(self, index: int) -> Table:
-        tabs = Text()
-        for i, d in enumerate(self.days):
-            today = i == len(self.days) - 1
-            tabs.append(f" {d.title.split(',')[0]}{' ●' if today else ''} ", "bold black on bright_blue" if i == index else "grey62")
-            tabs.append(" ")
+        cost = self._cost(None if index == len(self.days) - 1 else self.days[index].usage or {})
+        labels = [f" {d.title.split(',')[0]}{' ●' if i == len(self.days) - 1 else ''} " for i, d in enumerate(self.days)]
+        first, last = tab_window([len(l) + 1 for l in labels], index, self.console.size.width - len(cost.plain) - 16)
+        tabs = Text(f"‹ {first} " if first else "", "grey50")
+        for i in range(first, last):
+            tabs.append(labels[i], "bold black on bright_blue" if i == index else "grey62").append(" ")
+        if last < len(labels):
+            tabs.append(f"{len(labels) - last} ›", "grey50")
         grid = Table.grid(expand=True)
         grid.add_column(no_wrap=True)
         grid.add_column(justify="right", no_wrap=True)
-        grid.add_row(Text(" dew ", "bold bright_white") + tabs, self._cost(None if index == len(self.days) - 1 else self.days[index].usage or {}))
+        grid.add_row(Text(" dew ", "bold bright_white") + tabs, cost)
         return grid
 
     def _cost(self, past: dict | None = None) -> Text:
@@ -301,7 +312,7 @@ class TUI:
 
     def _plan(self, day: Day) -> Panel:
         if not day.scripts:
-            return self._panel(Text("no script yet", "grey50"), "Plan", "plan")
+            return self._panel(Text("no script yet", "grey50"), "Script", "plan")
         script = day.scripts[-1]
         running = self.script_live and day is self.days[-1]
         at = (self.line() if running else None) or script.get("line")  # the runner's line: it moves with every SDK call, facts too
@@ -311,15 +322,27 @@ class TUI:
         waiting = self.waiting()
         after = [f"{'next' if i == 0 else 'then'}: {g}" for i, g in enumerate(waiting)] or (["next: nothing queued"] if day is self.days[-1] else [])
         body = Code(script["goal"], script["source"], at, self.plan_top, self._plan_seen, after)
-        return self._panel(body, "Plan", "plan", where)
+        return self._panel(body, "Script", "plan", where)
+
+    def _day(self, day: Day) -> Panel:
+        """The planner's side of the day: its plan for it and its diary of it; a past day's diary first. The latest day also
+        shows the plan for tomorrow, once the night has written it (an earlier day's is the next day's plan)."""
+        latest = day is self.days[-1]
+        sections = [("plan", day.plan), ("diary", day.diary), ("tomorrow", day.tomorrow)] if latest else [("diary", day.diary), ("plan", day.plan)]
+        body = Text()
+        for heading, text in sections:
+            if text:
+                body.append(f"{heading}\n" if not body else f"\n\n{heading}\n", "bold grey62").append(text, "grey85" if heading == "plan" else "grey70")
+        return self._panel(body or Text("no plan from the planner for this day", "grey50"), "Day")
 
     def _help(self) -> Panel:
         keys = Table.grid(padding=(0, 3))
         keys.add_column(style="bold bright_white", no_wrap=True)
         keys.add_column(style="grey70")
         for key, does in (("type, Enter", "queue a message for the agent (it wakes, or reads it after its current thought)"),
-                          ("Tab", "switch the pane the keys scroll: Timeline or Plan"), ("↑ ↓, PgUp PgDn, wheel", "scroll it"),
+                          ("Tab", "switch the pane the keys scroll: Timeline or Script"), ("↑ ↓, PgUp PgDn, wheel", "scroll it"),
                           ("Home / End", "the start / follow the newest again"), ("← →", "earlier and later days"),
+                          ("Shift+← →", "a week back or on"), ("Ctrl+← →", "the first day / today"),
                           ("F8, in the game", "take control (the agent pauses); F8 again gives it back"), ("q", "quit, once the agent is done"),
                           ("?", "this help")):
             keys.add_row(key, does)
@@ -330,8 +353,6 @@ class TUI:
 
     def _farmer(self, day: Day, live: bool) -> Panel:
         s = day.status
-        if not live:
-            return self._panel(Text(day.diary or "no diary for this day", "grey70"), "Diary")
         if not s:
             return self._panel(Text("waiting for the game", "grey50"), "Farmer")
         grid = Table.grid(padding=(0, 1), expand=True)
@@ -356,7 +377,7 @@ class TUI:
         grid.add_row("pack", Text(f"{s.get('free', '?')} free"), "")
         if s.get("luck"):
             grid.add_row("luck", Text(str(s["luck"])), "")
-        return self._panel(grid, "Farmer")
+        return self._panel(grid, "Farmer" if live else "Farmer, as the day ended")
 
     def _queue(self) -> Panel | None:
         """Messages waiting for the agent, oldest first: what you sent and what the script printed. It reads them all when it next wakes."""
@@ -374,7 +395,8 @@ class TUI:
     def _activity(self, day: Day, live: bool) -> Text:
         """What the agent is doing this moment."""
         if not live:
-            return Text(" a past day · → comes back to today", "grey50")
+            index = self.days.index(day)
+            return Text(f" {day.title} · day {index + 1} of {len(self.days)} · → or Ctrl+→ comes back to today", "grey50")
         spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 8) % 10]
         line = Text(" ")
         if self._quit is not None:  # the agent stopped: say so, plainly
@@ -411,7 +433,7 @@ class TUI:
     def _hint(self) -> Text:
         if self.notice:
             return Text("  " + self.notice, "green")
-        return Text("  Enter sends to the agent · Tab pane · ↑↓ scroll · ←→ days · ? help"
+        return Text("  Enter sends to the agent · Tab pane · ↑↓ scroll · ←→ days (⇧ a week, Ctrl first/today) · ? help"
                     + (f" · {self.header}" if self.header else ""), "grey42")
 
     # --- keys ------------------------------------------------------------------------------------------------
@@ -433,11 +455,9 @@ class TUI:
             if button in (64, 65):
                 self.focus = "timeline" if x < self.console.size.width * 0.6 else "plan"
                 self._scroll(3 if button == 64 else -3)
-        elif key == "\x1b[D":  # left
-            self.viewing, self.scroll, self.plan_top = max(0, index - 1), 0, None
-        elif key == "\x1b[C":  # right
-            self.viewing = None if index + 1 >= last else index + 1
-            self.scroll, self.plan_top = 0, None
+        elif key in DAY_KEYS:
+            to = max(0, min(last, index + DAY_KEYS[key]))
+            self.viewing, self.scroll, self.plan_top = None if to == last else to, 0, None
         elif key == "\x1b[A":
             self._scroll(1)
         elif key == "\x1b[B":
@@ -483,7 +503,9 @@ class TUI:
                 self.plan_top = 1
 
 
-KEY = re.compile(r"\x1b\[<\d+;\d+;\d+[mM]|\x1b\[\d*~|\x1b\[[A-Za-z]|\x1bO[A-Za-z]|\x1b|[\s\S]")
+KEY = re.compile(r"\x1b\[<\d+;\d+;\d+[mM]|\x1b\[[\d;]*[~A-Za-z]|\x1bO[A-Za-z]|\x1b|[\s\S]")
+# ←/→ a day, Shift a week, Ctrl to the first day or today
+DAY_KEYS = {"\x1b[D": -1, "\x1b[C": 1, "\x1b[1;2D": -7, "\x1b[1;2C": 7, "\x1b[1;5D": -10**6, "\x1b[1;5C": 10**6}
 MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)[mM]")
 MOUSE_ON, MOUSE_OFF = "\x1b[?1000h\x1b[?1006h", "\x1b[?1000l\x1b[?1006l"  # wheel events, in the SGR encoding
 
@@ -531,6 +553,20 @@ def hang(console: Console, line: Text, width: int) -> list[Text]:
     indent = 6 if re.match(r"\d\d:\d\d |      ", plain) else 0  # continue in line with the text, after the time column
     rows = list(line.wrap(console, max(10, width - indent), overflow="fold"))
     return rows[:1] + [Text(" " * indent) + r for r in rows[1:]]
+
+
+def tab_window(widths: list[int], selected: int, room: int) -> tuple[int, int]:
+    """The tabs [first, last) to show: the selected one, and as many around it as fit in room, the later ones first."""
+    first, last, used = selected, selected + 1, widths[selected]
+    while True:
+        grew = False
+        for side in ("after", "before"):
+            if side == "after" and last < len(widths) and used + widths[last] <= room:
+                used, last, grew = used + widths[last], last + 1, True
+            elif side == "before" and first > 0 and used + widths[first - 1] <= room:
+                first, used, grew = first - 1, used + widths[first - 1], True
+        if not grew:
+            return first, last
 
 
 def minutes_since_6am(clock: int) -> int:

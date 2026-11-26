@@ -140,7 +140,7 @@ class Display:
 
 
 def notes_text(text: str, data: dict, verbose: bool = False) -> str:
-    """A memory change, the diary, or a consolidation, on one line."""
+    """A memory change or the diary, on one line."""
     if data.get("value") and not text.startswith(("forgot", "remember refused", "forget refused")):
         text = f"{text}: {data['value']}"
     return text if verbose else text[:400]

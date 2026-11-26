@@ -1,4 +1,4 @@
-"""Lasting memory (remember, forget, memory.json, the nightly consolidation) and the save's storage (paths, day transcripts, context, migration)."""
+"""Lasting memory (remember, forget, memory.json, the planner's night) and the save's storage (paths, day transcripts, context, migration)."""
 
 import asyncio
 import json
@@ -11,7 +11,6 @@ from conftest import FakeGame
 from rich.console import Console
 from stardew_agent import director as director_module
 from stardew_agent import look
-from stardew_agent import memory as kv
 from stardew_agent.brain import Brain
 from stardew_agent.director import Director
 from stardew_agent.look import Image
@@ -27,13 +26,12 @@ def brain_with(memory):
     return Brain(Context(None, memory=memory), api_key="x", model="m", system="s")
 
 
-def make_director(tmp_path, monkeypatch=None, memory_model="hy4-flash", client=None, verbose=False):
+def make_director(tmp_path, monkeypatch=None):
     shown = []
     save = SaveData(tmp_path / "data", "Farm_1")
     save.prepare(old_root=tmp_path / "old")
-    brain = NS(messages=[], usage=NS(turns=0), client=client, on_context=None)
-    d = Director(FakeGame(), brain, Context(FakeGame()), save=save, show=lambda kind, text, data=None, ok=True: shown.append((kind, text, data, ok)),
-                 memory_model=memory_model, verbose=verbose)
+    brain = NS(messages=[], usage=NS(turns=0), on_context=None)
+    d = Director(FakeGame(), brain, Context(FakeGame()), save=save, show=lambda kind, text, data=None, ok=True: shown.append((kind, text, data, ok)))
     d.shown = shown
     if monkeypatch:
         async def state(g):
@@ -152,13 +150,13 @@ def test_the_cli_takes_a_data_flag(monkeypatch):
     from stardew_agent import cli
 
     seen = {}
-    monkeypatch.setattr("sys.argv", ["stardew", "play", "--data", "/somewhere", "--memory-model", "none"])
+    monkeypatch.setattr("sys.argv", ["stardew", "play", "--data", "/somewhere"])
     monkeypatch.setattr(cli, "load_dotenv", lambda path: None)
     monkeypatch.setattr(cli, "ROOT", Path("/nonexistent"))  # not the user's own stardew.toml
     monkeypatch.setattr(cli.asyncio, "run", lambda coro: (seen.update(coro.cr_frame.f_locals), coro.close()))
     cli.main()
     args = seen["args"]
-    assert args.data == "/somewhere" and args.memory_model == "none"
+    assert args.data == "/somewhere"
 
 
 def test_old_data_is_moved_over_once(tmp_path):
@@ -266,132 +264,82 @@ def test_a_restart_starts_the_day_from_its_morning(tmp_path, monkeypatch):
     assert d.brain.messages == [] and prompt.startswith("# Memory") and "short first script" in prompt
 
 
-# --- consolidation -------------------------------------------------------------------------------------------
+# --- the planner's night ----------------------------------------------------------------------------------
 
 
-class FakeClient:
-    def __init__(self, reply):
-        self.calls, self.reply = [], reply
-        self.messages = self
-
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
-        if isinstance(self.reply, Exception):
-            raise self.reply
-        return NS(content=[NS(type="text", text=self.reply)])
+def block(**b):
+    return NS(**b, model_dump=lambda **_: b)
 
 
-OLD = {"shop.pierre.hours": "9am-5pm", "shop.pierre.closed": "Wednesday", "quest.robin.deadline": "spring 3", "farm.chest": "by the house",
-       "person.haley.likes": "sunflowers"}
+class PlannerClient:
+    """Replies with the given turns of tool calls, one per request, the last one forever."""
+
+    def __init__(self, *turns):
+        self.seen, self.turns = [], list(turns)
+        self.messages = NS(create=self.create)
+
+    async def create(self, **kw):
+        self.seen.append(kw["messages"][:])
+        calls = self.turns.pop(0) if len(self.turns) > 1 else self.turns[0]
+        content = [block(type="tool_use", name=name, id=f"c{len(self.seen)}-{i}", input=args) for i, (name, args) in enumerate(calls)]
+        return NS(content=content, usage=NS(input_tokens=10, cache_read_input_tokens=0))
 
 
-def consolidating(tmp_path, reply, verbose=False):
-    client = FakeClient(reply)
-    d = make_director(tmp_path, client=client, verbose=verbose)
-    d.memory.facts = dict(OLD)
-    d.memory.save()
-    return d, client
-
-
-def test_a_good_consolidation_is_applied_with_a_backup(tmp_path):
-    new = {"shop.pierre.hours": "9am-5pm, closed Wednesday", "farm.chest": "north of the house", "person.haley.likes": "sunflowers"}
-    d, client = consolidating(tmp_path, "```json\n" + json.dumps(new) + "\n```", verbose=True)
-    asyncio.run(d.consolidate(DATE, "Moved the chest north of the house. Robin's quest is done."))
-    assert d.memory.facts == new and json.loads(d.save.memory_file.read_text()) == new
-    assert json.loads(d.save.memory_file.with_name("memory.json.bak").read_text()) == OLD
-    kind, text, data, ok = d.shown[-1]
-    assert kind == "notes" and text == "memory consolidated: 5 → 3 keys (merged 1, dropped 1, changed 2)"
-    assert "dropped quest.robin.deadline: spring 3" in data["changes"] and "merged shop.pierre.closed" in data["changes"]
-    sent = client.calls[0]
-    assert sent["model"] == "hy4-flash" and sent["thinking"] == {"type": "disabled"}
-    prompt = sent["messages"][0]["content"]
-    assert DATE in prompt and "Robin's quest is done" in prompt and '"farm.chest": "by the house"' in prompt and "JSON" in prompt
-
-
-@pytest.mark.parametrize("reply, why", [
-    ("Here is the memory: {", "isn't JSON"),
-    ('["a", "b"]', "isn't a JSON object"),
-    ('{"farm.chest": 3, "shop.pierre.hours": "9", "person.haley.likes": "x"}', "isn't text"),
-    ('{"farm.chest": "x"}', "drop 4 of 5"),
-    (json.dumps({**OLD, **{f"fact.{i}": "v" for i in range(150)}}), "over the limit"),
-    (json.dumps({**OLD, "farm.chest": "x" * 501}), "over 500"),
-    (json.dumps({**OLD, "bad key": "x"}), "bad key"),
-    ("", "no text"),
-    (RuntimeError("gateway down"), "failed"),
-])
-def test_a_bad_consolidation_keeps_the_memory(tmp_path, reply, why):
-    d, client = consolidating(tmp_path, reply)
-    asyncio.run(d.consolidate(DATE, "a day"))
-    assert d.memory.facts == OLD and json.loads(d.save.memory_file.read_text()) == OLD
-    assert not d.save.memory_file.with_name("memory.json.bak").exists()
-    kind, text, data, ok = d.shown[-1]
-    assert text.startswith("memory kept as it was") and why in text
-
-
-def test_consolidation_can_be_turned_off(tmp_path):
-    client = FakeClient("{}")
-    d = make_director(tmp_path, memory_model=None, client=client)
-    asyncio.run(d.consolidate(DATE, "a day"))
-    assert client.calls == []
-
-
-def test_the_imported_notes_survive_consolidation_unchanged(tmp_path):
-    d, client = consolidating(tmp_path, "")
-    d.memory.facts["notes"] = "n" * 3000
-    client.reply = json.dumps(d.memory.facts)
-    asyncio.run(d.consolidate(DATE, "a day"))
-    assert d.shown[-1][1].startswith("memory consolidated")
-
-
-def test_the_change_counts():
-    old = {"a": "parsnips sell for 35g", "b": "x", "c": "y"}
-    new = {"a": "parsnips sell for 35g at Pierre's", "d": "z"}
-    change = kv.compare(old, new)
-    assert (change.merged, change.dropped, change.changed, change.added) == ([], ["b", "c"], ["a"], ["d"])
-    assert str(change) == "memory consolidated: 3 → 2 keys (merged 0, dropped 2, changed 1, added 1)"
-
-
-def test_one_long_fact_may_be_split_into_several(tmp_path):
-    notes = "Pierre's shop opens 9am-5pm and is closed on Wednesdays. The chest is north of the house. Haley likes sunflowers."
-    split = {"shop.pierre.hours": "9am-5pm, closed Wednesdays", "farm.chest": "north of the house", "person.haley.likes": "sunflowers"}
-    client = FakeClient(json.dumps(split))
-    d = make_director(tmp_path, client=client)
-    d.memory.facts = {"notes": notes}
-    d.memory.save()
-    asyncio.run(d.consolidate(DATE, "a day"))
-    assert d.memory.facts == split  # one key dropped, but its facts are kept
-
-
-def test_losing_most_of_the_text_is_refused(tmp_path):
-    client = FakeClient(json.dumps({"notes": "short"}))
-    d = make_director(tmp_path, client=client)
-    d.memory.facts = {"notes": "x" * 400}
-    d.memory.save()
-    asyncio.run(d.consolidate(DATE, "a day"))
-    assert d.memory.facts == {"notes": "x" * 400} and "characters" in d.shown[-1][1]
+PLAN = ("plan", {"diary": "Planted parsnips.", "goals": "Spring Crops bundle", "tomorrow": "plant potatoes"})
 
 
 def test_the_planner_keeps_its_goals_and_conversation_across_nights(tmp_path):
     from stardew_agent.planner import Planner
 
-    def block(**b):
-        return NS(**b, model_dump=lambda **_: b)
-
-    class Client:
-        def __init__(self):
-            self.seen = []
-            self.messages = NS(create=self.create)
-
-        async def create(self, **kw):
-            self.seen.append(len(kw["messages"]))
-            plan = block(type="tool_use", name="plan", id=f"p{len(self.seen)}", input={"goals": "Spring Crops bundle", "tomorrow": "plant potatoes"})
-            return NS(content=[plan], usage=NS(input_tokens=10, cache_read_input_tokens=0))
-
-    client = Client()
+    client = PlannerClient([PLAN])
     planner = Planner(client, "m", tmp_path / "planner.json")
-    asyncio.run(planner.night("Mon spring 1", "a diary"))
+    assert asyncio.run(planner.night("Mon spring 1", "the long record of the day", Memory())) == "Planted parsnips."
     planner.save()
     again = Planner(client, "m", tmp_path / "planner.json")
-    asyncio.run(again.night("Tue spring 2", "another diary"))
+    asyncio.run(again.night("Tue spring 2", "another day", Memory()))
     assert "Spring Crops bundle" in again.morning() and "plant potatoes" in again.morning()
-    assert client.seen == [1, 5]  # the second night sees the first: its opening, the plan call and result, and the close
+    second = client.seen[1]
+    assert len(second) == 5  # the second night sees the first: its opening, the plan call and result, and the close
+    opening = second[0]["content"][0]["text"]
+    assert "Planted parsnips." in opening and "the long record of the day" not in opening  # a past night keeps only its diary
+
+
+def test_the_planner_tidies_the_memory(tmp_path):
+    from stardew_agent.planner import Planner
+
+    memory = Memory()
+    memory.facts = {"quest.robin.deadline": "spring 3", "farm.chest": "by the house"}
+    client = PlannerClient([("forget", {"key": "quest.robin.deadline"}), ("remember", {"key": "farm.chest", "value": "north of the house"})], [PLAN])
+    planner = Planner(client, "m", tmp_path / "planner.json")
+    asyncio.run(planner.night(DATE, "a day", memory))
+    assert memory.facts == {"farm.chest": "north of the house"}
+
+
+def test_a_failed_night_keeps_last_nights_plan_and_no_diary(tmp_path):
+    from stardew_agent.planner import Planner
+
+    client = PlannerClient([PLAN])
+    planner = Planner(client, "m", tmp_path / "planner.json")
+    asyncio.run(planner.night("Mon spring 1", "a day", Memory()))
+
+    async def broken(**kw):
+        raise RuntimeError("gateway down")
+
+    client.messages = NS(create=broken)
+    before = list(planner.messages)
+    assert asyncio.run(planner.night("Tue spring 2", "another day", Memory())) == ""
+    assert planner.messages == before and planner.tomorrow == "plant potatoes"
+
+
+def test_the_day_record_shows_what_the_agent_did():
+    from stardew_agent.planner import record
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "# Memory\n(empty)"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Water first."},
+                                          {"type": "tool_use", "id": "a", "name": "run", "input": {"goal": "water the crops", "script": "water_all()"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": [{"type": "text", "text": "started"}]}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "wait", "input": {}}]},
+    ]
+    text = record(messages)
+    assert "AGENT: Water first." in text and "RUN (water the crops):\nwater_all()" in text and "-> started" in text and "WAIT" not in text
